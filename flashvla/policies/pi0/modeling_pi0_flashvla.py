@@ -22,10 +22,7 @@ from lerobot.configs.policies import PreTrainedConfig, T
 from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.utils.constants import ACTION, OBS_STATE, OBS_LANGUAGE_TOKENS, OBS_LANGUAGE_ATTENTION_MASK
 
-from flashvla.policies.loading import (
-    assert_checkpoint_covers_parameters,
-    restore_untied_lm_head_embeddings,
-)
+from flashvla.policies.loading import load_pi0_checkpoint
 from flashvla.policies.pi0.configuration_pi0 import PI0FlashVLAConfig
 from flashvla.policies.pi0.modeling_pi0 import (
     PI0PrefixEmbedder,
@@ -43,6 +40,7 @@ from flashvla.policies.pi05.utils import (
     create_sinusoidal_pos_embedding_for_blocks,
     load_cold_start_stats,
 )
+from flashvla.layers.linear import QKVLinear, MergedColumnLinear
 
 
 @torch._dynamo.disable
@@ -232,8 +230,6 @@ class FlashVLAPI0ModelLayer(BasePI0ModelLayer):
         action_expert_layer: nn.Module,
     ):
         super().__init__(config, vlm_layer, action_expert_layer)
-        self.input_layernorm = nn.ModuleList(self.input_layernorm)
-        self.post_attention_layernorm = nn.ModuleList(self.post_attention_layernorm)
 
 
 class PI0FlashVLAModel(nn.Module):
@@ -250,6 +246,9 @@ class PI0FlashVLAModel(nn.Module):
             config.action_expert_config.adarms_cond_dim = config.action_expert_config.hidden_size
         self.vlm = PaliGemmaForConditionalGeneration(config.vlm_config)
         self.action_expert = GemmaForCausalLM(config.action_expert_config)
+        # As in lerobot's PI0: the action expert never embeds tokens, and both
+        # lm_heads stay untied, unused parameters that the openpi checkpoint fills.
+        self.action_expert.model.embed_tokens = None
 
         self.prefix_embedder = PI0PrefixEmbedder(config, self.vlm)
         self.suffix_embedder = PI0SuffixEmbedder(config)
@@ -268,22 +267,18 @@ class PI0FlashVLAModel(nn.Module):
 
         self.to_bfloat16_for_selected_params(getattr(config, "dtype", "float32"))
 
+        # From here on the joint layers are the sole owners of the decoder
+        # weights; the backbone layer stacks become placeholders so that every
+        # parameter has exactly one state_dict name.
+        self.vlm.model.language_model.layers = nn.ModuleList([nn.Identity() for _ in self.layers])
+        self.action_expert.model.layers = nn.ModuleList([nn.Identity() for _ in self.layers])
+
         self.register_buffer("_cold_step_t", torch.zeros((), dtype=torch.int64), persistent=False)
 
         if config.compile_model:
             torch.set_float32_matmul_precision("high")
             self._cold_start = torch.compile(self._cold_start, mode=config.compile_mode)
             self._steady_streaming = torch.compile(self._steady_streaming, mode=config.compile_mode)
-
-    def detach_backbone_layer_aliases(self) -> None:
-        """Remove duplicate decoder paths after loading/fusing their parameters."""
-        num_layers = len(self.layers)
-        self.vlm.model.language_model.layers = nn.ModuleList(
-            [nn.Identity() for _ in range(num_layers)]
-        )
-        self.action_expert.model.layers = nn.ModuleList(
-            [nn.Identity() for _ in range(num_layers)]
-        )
 
     def set_fsdp_compute_dtype(self, dtype: torch.dtype) -> None:
         """Record the unsharded compute dtype without consulting master shards."""
@@ -324,24 +319,18 @@ class PI0FlashVLAModel(nn.Module):
             raise ValueError(f"Invalid precision: {precision}")
 
     def init_qkv_fusion_from_existing(self) -> None:
-        from flashvla.layers.linear import QKVLinear
-
-        backbones = [self.vlm.model.language_model, self.action_expert.model]
-        for backbone in backbones:
-            num_layers = backbone.config.num_hidden_layers
-            for idx in range(num_layers):
-                layer = backbone.layers[idx]
-                attn = layer.self_attn
-                q_proj = attn.q_proj
-                k_proj = attn.k_proj
-                v_proj = attn.v_proj
-                hidden_size = q_proj.in_features
+        """Fuse each attention's q/k/v projections into one QKVLinear."""
+        for layer in self.layers:
+            for attn in (layer.self_attn.vlm_attention, layer.self_attn.action_expert_attention):
+                q_proj, k_proj, v_proj = attn.q_proj, attn.k_proj, attn.v_proj
                 head_dim = attn.head_dim
-                num_heads = self.vlm.model.language_model.config.num_attention_heads
-                num_kv_heads = self.vlm.model.language_model.config.num_key_value_heads
+                num_heads = attn.config.num_attention_heads
+                num_kv_heads = attn.config.num_key_value_heads
                 qkv = QKVLinear(
-                    hidden_size=hidden_size, head_size=head_dim,
-                    total_num_heads=num_heads, total_num_kv_heads=num_kv_heads,
+                    hidden_size=q_proj.in_features,
+                    head_size=head_dim,
+                    total_num_heads=num_heads,
+                    total_num_kv_heads=num_kv_heads,
                     bias=q_proj.bias is not None,
                 )
                 attn.qkv_proj = qkv
@@ -361,17 +350,13 @@ class PI0FlashVLAModel(nn.Module):
                 delattr(attn, "v_proj")
 
     def init_mlp_fusion_from_existing(self) -> None:
-        from flashvla.layers.linear import MergedColumnLinear
-
-        backbones = [self.vlm.model.language_model, self.action_expert.model]
-        for backbone in backbones:
-            num_layers = backbone.config.num_hidden_layers
-            for idx in range(num_layers):
-                layer = backbone.layers[idx]
-                mlp = layer.mlp
-                hidden_size = mlp.hidden_size
+        """Fuse each MLP's gate/up projections into one MergedColumnLinear."""
+        for layer in self.layers:
+            for mlp in (layer.mlp.vlm_mlp, layer.mlp.action_expert_mlp):
                 intermediate_size = mlp.intermediate_size
-                gate_up = MergedColumnLinear(hidden_size, [intermediate_size, intermediate_size], bias=False)
+                gate_up = MergedColumnLinear(
+                    mlp.hidden_size, [intermediate_size, intermediate_size], bias=False
+                )
                 mlp.gate_up_proj = gate_up
                 gate_up.to(device=mlp.gate_proj.weight.device, dtype=mlp.gate_proj.weight.dtype)
                 with torch.no_grad():
@@ -754,6 +739,20 @@ class PI0FlashVLAModel(nn.Module):
 
 
 
+# A plain pi0 checkpoint carries the expert's RMSNorm scales, which the adaRMS
+# expert replaces with FiLM projections; those projections and the suffix
+# embedder's conditioning MLPs are the parameters such a file cannot provide.
+_ADARMS_INCOMPATIBLE_KEYS = (
+    r"^model\.layers\.\d+\.(input_layernorm|post_attention_layernorm)\.1\.weight$",
+    r"^model\.action_expert\.model\.norm\.weight$",
+)
+_ADARMS_FRESH_KEYS = (
+    r"^model\.layers\.\d+\.(input_layernorm|post_attention_layernorm)\.1\.dense\.",
+    r"^model\.action_expert\.model\.norm\.dense\.",
+    r"^model\.suffix_embedder\.(time_mlp_in|time_mlp_out|state_mlp_in|state_mlp_out)\.",
+)
+
+
 class PI0FlashVLAPolicy(PreTrainedPolicy):
     """PI0 FlashVLA Policy wrapper."""
 
@@ -784,6 +783,7 @@ class PI0FlashVLAPolicy(PreTrainedPolicy):
     def __init__(
         self,
         config: PI0FlashVLAConfig,
+        **kwargs,
     ):
         super().__init__(config)
         config.validate_features()
@@ -802,183 +802,64 @@ class PI0FlashVLAPolicy(PreTrainedPolicy):
         self.reset()
 
     def prepare_for_fsdp(self, *, compute_dtype: torch.dtype) -> None:
-        """Finalize canonical decoder ownership before distributed wrapping."""
+        """Record the compute dtype and keep the unused lm_heads out of the optimizer."""
         self.model.set_fsdp_compute_dtype(compute_dtype)
-        for lm_head, embedding in (
-            (self.model.vlm.lm_head, self.model.vlm.language_model.embed_tokens),
-            (self.model.action_expert.lm_head, self.model.action_expert.model.embed_tokens),
-        ):
-            if lm_head.weight is not embedding.weight:
-                lm_head.requires_grad_(False)
-        parameter_ids_before = {id(parameter) for parameter in self.parameters()}
-        self.model.detach_backbone_layer_aliases()
-        parameter_ids_after = {id(parameter) for parameter in self.parameters()}
-        if parameter_ids_before != parameter_ids_after:
-            raise RuntimeError(
-                "Detaching PI0 backbone aliases changed the parameter set: "
-                f"before={len(parameter_ids_before)}, after={len(parameter_ids_after)}, "
-                f"dropped={len(parameter_ids_before - parameter_ids_after)}, "
-                f"added={len(parameter_ids_after - parameter_ids_before)}"
-            )
+        self.model.vlm.lm_head.requires_grad_(False)
+        self.model.action_expert.lm_head.requires_grad_(False)
 
     @classmethod
-    def from_pretrained(
-        cls: builtins.type[T],
-        pretrained_name_or_path: str | Path,
-        *,
-        config: PreTrainedConfig | None = None,
-        force_download: bool = False,
-        resume_download: bool | None = None,
-        proxies: dict | None = None,
-        token: str | bool | None = None,
-        cache_dir: str | Path | None = None,
-        local_files_only: bool = False,
-        revision: str | None = None,
-        **kwargs,
+    def _load_as_safetensor(
+        cls: builtins.type[T], model: T, model_file: str, map_location: str, strict: bool
     ) -> T:
-        if config is None:
-            config = PreTrainedConfig.from_pretrained(
-                pretrained_name_or_path=pretrained_name_or_path,
-                force_download=force_download,
-                resume_download=resume_download,
-                proxies=proxies,
-                token=token,
-                cache_dir=cache_dir,
-                local_files_only=local_files_only,
-                revision=revision,
-                **kwargs,
-            )
+        """Fill a freshly-built policy from ``model.safetensors``.
 
-        kwargs.pop("dataset_stats", None)
-        instance = cls(config, **kwargs)
-
-        from safetensors.torch import load_file
-        from transformers.utils import cached_file
-
-        original_state_dict: dict[str, Tensor] | None = None
-        if os.path.isdir(pretrained_name_or_path):
-            model_file = os.path.join(pretrained_name_or_path, "model.safetensors")
-            if not os.path.isfile(model_file):
-                raise FileNotFoundError(f"No 'model.safetensors' found in directory: {model_file}")
-            original_state_dict = load_file(model_file)
-        else:
-            resolved_file = cached_file(
-                pretrained_name_or_path, "model.safetensors",
-                cache_dir=cache_dir, force_download=force_download,
-                resume_download=resume_download, proxies=proxies,
-                token=token, revision=revision, local_files_only=local_files_only,
-            )
-            if resolved_file is None:
-                raise FileNotFoundError(f"Could not resolve 'model.safetensors' for {pretrained_name_or_path}")
-            original_state_dict = load_file(resolved_file)
-
-        prefix_rules: list[tuple[str, str]] = [
-            ("model.action_in_proj.", "model.suffix_embedder.action_in_proj."),
-            ("model.action_out_proj.", "model.action_out_proj."),
-            ("model.action_time_mlp_in.", "model.suffix_embedder.action_time_mlp_in."),
-            ("model.action_time_mlp_out.", "model.suffix_embedder.action_time_mlp_out."),
-            ("model.state_proj.", "model.suffix_embedder.state_proj."),
-            ("model.paligemma_with_expert.gemma_expert.", "model.action_expert."),
-            ("model.paligemma_with_expert.paligemma.", "model.vlm."),
-            ("action_in_proj.", "model.suffix_embedder.action_in_proj."),
-            ("action_out_proj.", "model.action_out_proj."),
-            ("action_time_mlp_in.", "model.suffix_embedder.action_time_mlp_in."),
-            ("action_time_mlp_out.", "model.suffix_embedder.action_time_mlp_out."),
-            ("state_proj.", "model.suffix_embedder.state_proj."),
-            ("paligemma_with_expert.gemma_expert.", "model.action_expert."),
-            ("paligemma_with_expert.paligemma.", "model.vlm."),
-        ]
-
-        def map_key(key: str) -> str | None:
-            for src, dst in prefix_rules:
-                if key.startswith(src):
-                    return dst + key[len(src):]
-            return key
-
-        target_sd = instance.state_dict()
-        mapped_sd: dict[str, Tensor] = {}
-        for old_key, value in original_state_dict.items():
-            new_key = map_key(old_key)
-            if new_key not in target_sd:
-                continue
-            if target_sd[new_key].shape != value.shape:
-                continue
-            mapped_sd[new_key] = value
-
-        restored_embeddings = restore_untied_lm_head_embeddings(instance, mapped_sd, target_sd)
-        if restored_embeddings:
-            logger.info(
-                "Restored %d tied input embedding(s) from their lm_head: %s",
-                len(restored_embeddings),
-                ", ".join(restored_embeddings),
-            )
-
-        # Parameters this branch deliberately (re)initializes instead of loading.
-        freshly_initialized: set[str] = set()
-
-        if getattr(config, "use_adarms_time_cond", False):
-            from flashvla.policies.pi05.patches import FlashVLARMSNorm as PatchedGemmaRMSNorm
-            from lerobot.policies.pi_gemma import (
-                PiGemmaRMSNorm as OriginalGemmaRMSNorm,
-            )
-            n_zeroed = 0
-            n_kept = 0
-            ae_prefix = "model.action_expert."
-            with torch.no_grad():
-                for name, module in instance.model.action_expert.named_modules():
-                    if type(module) is OriginalGemmaRMSNorm:
-                        module.__class__ = PatchedGemmaRMSNorm
-                    if isinstance(module, OriginalGemmaRMSNorm) and getattr(module, "dense", None) is not None:
-                        dense_w_key = f"{ae_prefix}{name}.dense.weight"
-                        if dense_w_key in mapped_sd:
-                            n_kept += 1
-                        else:
-                            module.dense.weight.zero_()
-                            freshly_initialized.add(dense_w_key)
-                            if module.dense.bias is not None:
-                                module.dense.bias.zero_()
-                                freshly_initialized.add(f"{ae_prefix}{name}.dense.bias")
-                            n_zeroed += 1
-                se = instance.model.suffix_embedder
-                if hasattr(se, "state_mlp_out"):
-                    if "model.suffix_embedder.state_mlp_out.weight" not in mapped_sd:
-                        se.state_mlp_out.weight.zero_()
-                        freshly_initialized.add("model.suffix_embedder.state_mlp_out.weight")
-                        if se.state_mlp_out.bias is not None:
-                            se.state_mlp_out.bias.zero_()
-                            freshly_initialized.add("model.suffix_embedder.state_mlp_out.bias")
-            logger.info(
-                f"adaRMS mode: zero-init'd {n_zeroed} fresh FiLM dense layers "
-                f"(DiT identity), {n_kept} layers will be loaded from ckpt"
-            )
-
-        incompatible = instance.load_state_dict(mapped_sd, strict=False)
-        unexpected_keys = incompatible.unexpected_keys
-        unexpected_fatal = list(unexpected_keys)
-        if unexpected_fatal:
-            raise RuntimeError(
-                "Checkpoint loading failed.\n"
-                f"Unexpected keys: {unexpected_fatal}"
-            )
-
-        assert_checkpoint_covers_parameters(
-            instance,
-            mapped_sd,
-            source=str(pretrained_name_or_path),
-            allow=freshly_initialized,
+        Overrides lerobot's hook (the base ``from_pretrained`` resolves the
+        config, locates the file and builds the instance first). The load is
+        lerobot's recipe: rename the openpi keys, then one strict
+        ``load_state_dict``. With ``use_adarms_time_cond`` the action expert
+        carries adaRMS projections a plain pi0 checkpoint cannot provide: as in
+        lerobot, the file's plain expert norm scales are skipped, the FiLM
+        projections it lacks are zero-initialized (an identity), and the suffix
+        embedder's conditioning MLPs keep their initialization. Weight-dependent
+        post-load (RMSNorm swap, qkv/mlp fusion, cold-start stats) runs here;
+        the base does ``.to(device)`` / ``.eval()`` afterwards.
+        """
+        adarms = bool(getattr(model.config, "use_adarms_time_cond", False))
+        fresh = load_pi0_checkpoint(
+            model,
+            model_file,
+            drop=_ADARMS_INCOMPATIBLE_KEYS if adarms else (),
+            fresh=_ADARMS_FRESH_KEYS if adarms else (),
         )
 
-        instance.to(config.device)
-        instance.eval()
+        if adarms:
+            from flashvla.policies.pi05.patches import FlashVLARMSNorm as PatchedGemmaRMSNorm
+            from lerobot.policies.pi_gemma import PiGemmaRMSNorm as OriginalGemmaRMSNorm
 
-        if getattr(config, "fuse_qkv", True):
-            instance.model.init_qkv_fusion_from_existing()
-        if getattr(config, "fuse_gate_up", True):
-            instance.model.init_mlp_fusion_from_existing()
+            expert_norms = [model.model.action_expert.model.norm]
+            for layer in model.model.layers:
+                expert_norms += [layer.input_layernorm[1], layer.post_attention_layernorm[1]]
+            for module in expert_norms:
+                if type(module) is OriginalGemmaRMSNorm:
+                    module.__class__ = PatchedGemmaRMSNorm
+            parameters = dict(model.named_parameters())
+            with torch.no_grad():
+                for name in fresh:
+                    if ".dense." in name:
+                        parameters[name].zero_()
+            logger.info(
+                "adaRMS mode: %d parameters not in the checkpoint; FiLM projections zeroed",
+                len(fresh),
+            )
 
-        instance._cold_start_stats = load_cold_start_stats(pretrained_name_or_path)
+        if getattr(model.config, "fuse_qkv", True):
+            model.model.init_qkv_fusion_from_existing()
+        if getattr(model.config, "fuse_gate_up", True):
+            model.model.init_mlp_fusion_from_existing()
 
-        return instance
+        model._cold_start_stats = load_cold_start_stats(os.path.dirname(model_file))
+
+        return model
 
     def reset(self):
         """Reset buffer and step counter. Call when environment resets.

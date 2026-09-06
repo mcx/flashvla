@@ -13,11 +13,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Rewrite a PI0.5 checkpoint saved before the alias-free layout.
+"""Rewrite a PI0 / PI0.5 checkpoint saved before the alias-free layout.
 
-Earlier versions of both PI0.5 policies registered several parameters under
-more than one name: the joint layers aliased the backbone layer stacks, the
-prefix embedder re-registered the VLM embedding as ``lang_embedder``, and
+Earlier versions of the PI0 and PI0.5 policies registered several parameters
+under more than one name: the joint layers aliased the backbone layer stacks,
+the prefix embedder re-registered the VLM embedding as ``lang_embedder``, and
 ``PI05FlashVLAModel`` tied each lm_head to its embedding. Depending on the save
 path a file could carry any subset of those names, and FSDP2 exports of the
 tied model hold a stale ``vlm.lm_head``. The loader is now one strict
@@ -44,7 +44,7 @@ from pathlib import Path
 import torch
 from safetensors.torch import load_file, save_file
 
-from flashvla.policies.loading import PI05_VLM_EMBED_KEY, PI05_VLM_HEAD_KEY
+from flashvla.policies.loading import VLM_EMBED_KEY, VLM_HEAD_KEY
 
 _VLM_LAYER = r"^model\.vlm\.model\.language_model\.layers\.(\d+)\."
 _EXPERT_LAYER = r"^model\.action_expert\.model\.layers\.(\d+)\."
@@ -68,8 +68,9 @@ def convert_legacy_state_dict(
 
     Alias names of one parameter must agree and collapse to one entry. The
     action expert's embedding no longer exists and is dropped. With
-    ``tied_heads`` (``PI05FlashVLAModel`` checkpoints) each lm_head is set to
-    its embedding, the value the tied model actually held.
+    ``tied_heads`` (``PI05FlashVLAModel`` checkpoints; the PI0 models and the
+    PI0.5 baseline never tied) each lm_head is set to its embedding, the value
+    the tied model actually held.
     """
     converted: dict[str, torch.Tensor] = {}
     for key, value in state_dict.items():
@@ -85,7 +86,7 @@ def convert_legacy_state_dict(
 
     expert_embed = converted.pop(EXPERT_EMBED_KEY, None)
     if tied_heads:
-        converted[PI05_VLM_HEAD_KEY] = converted[PI05_VLM_EMBED_KEY].clone()
+        converted[VLM_HEAD_KEY] = converted[VLM_EMBED_KEY].clone()
         if expert_embed is not None:
             converted[EXPERT_HEAD_KEY] = expert_embed
     return converted

@@ -30,10 +30,7 @@ from lerobot.policies.pi_gemma import (
 from lerobot.configs.policies import PreTrainedConfig, T
 from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.utils.constants import ACTION, OBS_STATE, OBS_LANGUAGE_TOKENS, OBS_LANGUAGE_ATTENTION_MASK
-from flashvla.policies.loading import (
-    assert_checkpoint_covers_parameters,
-    restore_untied_lm_head_embeddings,
-)
+from flashvla.policies.loading import load_pi0_checkpoint
 from flashvla.policies.pi0.configuration_pi0 import PI0Config
 from flashvla.policies.pi0.utils import (
     create_sinusoidal_pos_embedding,
@@ -65,8 +62,9 @@ class PI0PrefixEmbedder(nn.Module):
     def __init__(self, config: PI0Config, vlm: PaliGemmaForConditionalGeneration):
         super().__init__()
         self.config = config
+        # A plain reference rather than a registered submodule, so the VLM's
+        # embedding keeps exactly one state_dict name.
         self._paligemma_model = [vlm.model]
-        self.lang_embedder = vlm.language_model.embed_tokens
 
     def forward(self, images, img_masks, tokens, masks):
         """Embed images and language into prefix sequence.
@@ -105,7 +103,7 @@ class PI0PrefixEmbedder(nn.Module):
             pad_masks.append(img_mask[:, None].expand(bsz, num_img_embs))
             att_masks += [0] * num_img_embs
 
-        lang_emb = self.lang_embedder(tokens)
+        lang_emb = self._paligemma_model[0].language_model.embed_tokens(tokens)
         lang_emb_dim = lang_emb.shape[-1]
         lang_emb = lang_emb * math.sqrt(lang_emb_dim)
 
@@ -312,8 +310,10 @@ class PI0ModelLayer(nn.Module):
     ):
         super().__init__()
         self.config = config
-        self.input_layernorm = [vlm_layer.input_layernorm, action_expert_layer.input_layernorm]
-        self.post_attention_layernorm = [vlm_layer.post_attention_layernorm, action_expert_layer.post_attention_layernorm]
+        self.input_layernorm = nn.ModuleList([vlm_layer.input_layernorm, action_expert_layer.input_layernorm])
+        self.post_attention_layernorm = nn.ModuleList(
+            [vlm_layer.post_attention_layernorm, action_expert_layer.post_attention_layernorm]
+        )
 
         self.self_attn = PI0Attention(
             config,
@@ -371,6 +371,9 @@ class PI0Model(nn.Module):
 
         self.vlm = PaliGemmaForConditionalGeneration(config.vlm_config)
         self.action_expert = GemmaForCausalLM(config.action_expert_config)
+        # As in lerobot's PI0: the action expert never embeds tokens, and both
+        # lm_heads stay untied, unused parameters that the openpi checkpoint fills.
+        self.action_expert.model.embed_tokens = None
 
         self.prefix_embedder = PI0PrefixEmbedder(config, self.vlm)
         self.suffix_embedder = PI0SuffixEmbedder(config)
@@ -391,34 +394,26 @@ class PI0Model(nn.Module):
 
         self.to_bfloat16_for_selected_params(getattr(config, "dtype", "float32"))
 
+        # From here on the joint layers are the sole owners of the decoder
+        # weights; the backbone layer stacks become placeholders so that every
+        # parameter has exactly one state_dict name.
+        self.vlm.model.language_model.layers = nn.ModuleList([nn.Identity() for _ in self.layers])
+        self.action_expert.model.layers = nn.ModuleList([nn.Identity() for _ in self.layers])
+
         if config.compile_model:
             torch.set_float32_matmul_precision("high")
             self.sample_actions = torch.compile(self.sample_actions, mode=config.compile_mode)
 
     def init_qkv_fusion_from_existing(self) -> None:
-        """Fuse Q/K/V projections for faster inference."""
-        backbones = [
-            self.vlm.model.language_model,
-            self.action_expert.model,
-        ]
-
-        for backbone in backbones:
-            num_layers = backbone.config.num_hidden_layers
-            for idx in range(num_layers):
-                layer = backbone.layers[idx]
-                attn = layer.self_attn
-
-                q_proj: nn.Linear = attn.q_proj
-                k_proj: nn.Linear = attn.k_proj
-                v_proj: nn.Linear = attn.v_proj
-
-                hidden_size = q_proj.in_features
+        """Fuse each attention's q/k/v projections into one QKVLinear."""
+        for layer in self.layers:
+            for attn in (layer.self_attn.vlm_attention, layer.self_attn.action_expert_attention):
+                q_proj, k_proj, v_proj = attn.q_proj, attn.k_proj, attn.v_proj
                 head_dim = attn.head_dim
-                num_heads = self.vlm.model.language_model.config.num_attention_heads
-                num_kv_heads = self.vlm.model.language_model.config.num_key_value_heads
-
+                num_heads = attn.config.num_attention_heads
+                num_kv_heads = attn.config.num_key_value_heads
                 qkv = QKVLinear(
-                    hidden_size=hidden_size,
+                    hidden_size=q_proj.in_features,
                     head_size=head_dim,
                     total_num_heads=num_heads,
                     total_num_kv_heads=num_kv_heads,
@@ -426,63 +421,33 @@ class PI0Model(nn.Module):
                 )
                 attn.qkv_proj = qkv
                 qkv.to(device=q_proj.weight.device, dtype=q_proj.weight.dtype)
-
                 with torch.no_grad():
-                    out_w = qkv.weight
-                    q_w = q_proj.weight
-                    k_w = k_proj.weight
-                    v_w = v_proj.weight
-
-                    head_dim_total = head_dim
-                    q_span = num_heads * head_dim_total
-                    kv_span = num_kv_heads * head_dim_total
-
-                    out_w[:q_span].copy_(q_w)
-                    out_w[q_span : q_span + kv_span].copy_(k_w)
-                    out_w[q_span + kv_span :].copy_(v_w)
-
+                    q_span = num_heads * head_dim
+                    kv_span = num_kv_heads * head_dim
+                    qkv.weight[:q_span].copy_(q_proj.weight)
+                    qkv.weight[q_span:q_span + kv_span].copy_(k_proj.weight)
+                    qkv.weight[q_span + kv_span:].copy_(v_proj.weight)
                     if qkv.bias is not None:
-                        out_b = qkv.bias
-                        q_b = q_proj.bias
-                        k_b = k_proj.bias
-                        v_b = v_proj.bias
-
-                        out_b[:q_span].copy_(q_b)
-                        out_b[q_span : q_span + kv_span].copy_(k_b)
-                        out_b[q_span + kv_span :].copy_(v_b)
-
+                        qkv.bias[:q_span].copy_(q_proj.bias)
+                        qkv.bias[q_span:q_span + kv_span].copy_(k_proj.bias)
+                        qkv.bias[q_span + kv_span:].copy_(v_proj.bias)
                 delattr(attn, "q_proj")
                 delattr(attn, "k_proj")
                 delattr(attn, "v_proj")
 
     def init_mlp_fusion_from_existing(self) -> None:
-        """Fuse gate/up projections for faster inference."""
-        backbones = [
-            self.vlm.model.language_model,
-            self.action_expert.model,
-        ]
-
-        for backbone in backbones:
-            num_layers = backbone.config.num_hidden_layers
-            for idx in range(num_layers):
-                layer = backbone.layers[idx]
-                mlp = layer.mlp
-
-                hidden_size = mlp.hidden_size
+        """Fuse each MLP's gate/up projections into one MergedColumnLinear."""
+        for layer in self.layers:
+            for mlp in (layer.mlp.vlm_mlp, layer.mlp.action_expert_mlp):
                 intermediate_size = mlp.intermediate_size
-
                 gate_up = MergedColumnLinear(
-                    hidden_size,
-                    [intermediate_size, intermediate_size],
-                    bias=False,
+                    mlp.hidden_size, [intermediate_size, intermediate_size], bias=False
                 )
                 mlp.gate_up_proj = gate_up
                 gate_up.to(device=mlp.gate_proj.weight.device, dtype=mlp.gate_proj.weight.dtype)
-
                 with torch.no_grad():
                     gate_up.weight[:intermediate_size].copy_(mlp.gate_proj.weight)
                     gate_up.weight[intermediate_size:].copy_(mlp.up_proj.weight)
-
                 delattr(mlp, "gate_proj")
                 delattr(mlp, "up_proj")
 
@@ -546,7 +511,7 @@ class PI0Model(nn.Module):
             state, x_t, time
         )
 
-        backbone_dtype = self.vlm.model.language_model.layers[0].self_attn.o_proj.weight.dtype
+        backbone_dtype = self.layers[0].self_attn.vlm_attention.o_proj.weight.dtype
         prefix_embs = prefix_embs.to(dtype=backbone_dtype)
         suffix_embs = suffix_embs.to(dtype=backbone_dtype)
 
@@ -647,7 +612,7 @@ class PI0Model(nn.Module):
         
         suffix_embs_concat = suffix_embs.view(batch_size, num_offsets * suffix_length, -1)
         
-        backbone_dtype = self.vlm.model.language_model.layers[0].self_attn.o_proj.weight.dtype
+        backbone_dtype = self.layers[0].self_attn.vlm_attention.o_proj.weight.dtype
         prefix_embs = prefix_embs.to(dtype=backbone_dtype)
         suffix_embs_concat = suffix_embs_concat.to(dtype=backbone_dtype)
         
@@ -704,7 +669,7 @@ class PI0Model(nn.Module):
             state, x_t, timestep
         )
 
-        backbone_dtype = self.vlm.model.language_model.layers[0].self_attn.o_proj.weight.dtype
+        backbone_dtype = self.layers[0].self_attn.vlm_attention.o_proj.weight.dtype
         suffix_embs = suffix_embs.to(dtype=backbone_dtype)
 
         pad_masks = torch.cat([prefix_pad_masks, suffix_pad_masks], dim=1)
@@ -805,6 +770,7 @@ class PI0Policy(PreTrainedPolicy):
     def __init__(
         self,
         config: PI0Config,
+        **kwargs,
     ):
         """Initialize PI0 policy.
 
@@ -821,125 +787,25 @@ class PI0Policy(PreTrainedPolicy):
         self.reset()
 
     @classmethod
-    def from_pretrained(
-        cls: builtins.type[T],
-        pretrained_name_or_path: str | Path,
-        *,
-        config: PreTrainedConfig | None = None,
-        force_download: bool = False,
-        resume_download: bool | None = None,
-        proxies: dict | None = None,
-        token: str | bool | None = None,
-        cache_dir: str | Path | None = None,
-        local_files_only: bool = False,
-        revision: str | None = None,
-        **kwargs,
+    def _load_as_safetensor(
+        cls: builtins.type[T], model: T, model_file: str, map_location: str, strict: bool
     ) -> T:
-        """Load pretrained PI0 policy from checkpoint."""
-        if config is None:
-            config = PreTrainedConfig.from_pretrained(
-                pretrained_name_or_path=pretrained_name_or_path,
-                force_download=force_download,
-                resume_download=resume_download,
-                proxies=proxies,
-                token=token,
-                cache_dir=cache_dir,
-                local_files_only=local_files_only,
-                revision=revision,
-                **kwargs,
-            )
+        """Fill a freshly-built policy from ``model.safetensors``.
 
-        kwargs.pop("dataset_stats", None)
-        instance = cls(config, **kwargs)
+        Overrides lerobot's hook (the base ``from_pretrained`` resolves the
+        config, locates the file and builds the instance first). The load is
+        lerobot's recipe: rename the openpi keys, then one strict
+        ``load_state_dict``. qkv/mlp fusion runs here; the base does ``.to`` /
+        ``.eval`` afterwards.
+        """
+        load_pi0_checkpoint(model, model_file)
 
-        from safetensors.torch import load_file
-        from transformers.utils import cached_file
+        if getattr(model.config, "fuse_qkv", True):
+            model.model.init_qkv_fusion_from_existing()
+        if getattr(model.config, "fuse_gate_up", True):
+            model.model.init_mlp_fusion_from_existing()
 
-        original_state_dict: dict[str, Tensor] | None = None
-
-        if os.path.isdir(pretrained_name_or_path):
-            model_file = os.path.join(pretrained_name_or_path, "model.safetensors")
-            if not os.path.isfile(model_file):
-                raise FileNotFoundError(f"No 'model.safetensors' found in directory: {model_file}")
-            else:
-                original_state_dict = load_file(model_file)
-        else:
-            resolved_file = cached_file(
-                pretrained_name_or_path,
-                "model.safetensors",
-                cache_dir=cache_dir,
-                force_download=force_download,
-                resume_download=resume_download,
-                proxies=proxies,
-                token=token,
-                revision=revision,
-                local_files_only=local_files_only,
-            )
-            if resolved_file is None:
-                raise FileNotFoundError(f"Could not resolve 'model.safetensors' for {pretrained_name_or_path}")
-            else:
-                original_state_dict = load_file(resolved_file)
-
-        prefix_rules: list[tuple[str, str]] = [
-            ("action_in_proj.", "model.suffix_embedder.action_in_proj."),
-            ("action_out_proj.", "model.action_out_proj."),
-            ("action_time_mlp_in.", "model.suffix_embedder.action_time_mlp_in."),
-            ("action_time_mlp_out.", "model.suffix_embedder.action_time_mlp_out."),
-            ("state_proj.", "model.suffix_embedder.state_proj."),
-            ("paligemma_with_expert.gemma_expert.", "model.action_expert."),
-            ("paligemma_with_expert.paligemma.", "model.vlm."),
-        ]
-
-        def map_key(key: str) -> str | None:
-            candidates = [key]
-            if key.startswith("model."):
-                candidates.append(key[len("model."):])
-            for cand in candidates:
-                for src, dst in prefix_rules:
-                    if cand.startswith(src):
-                        return dst + cand[len(src):]
-            return key
-
-        target_sd = instance.state_dict()
-        mapped_sd: dict[str, Tensor] = {}
-
-        for old_key, value in original_state_dict.items():
-            new_key = map_key(old_key)
-            if (new_key in target_sd) and (target_sd[new_key].shape != value.shape):
-                continue
-            mapped_sd[new_key] = value
-
-        restored_embeddings = restore_untied_lm_head_embeddings(instance, mapped_sd, target_sd)
-        if restored_embeddings:
-            logging.info(
-                "Restored %d tied input embedding(s) from their lm_head: %s",
-                len(restored_embeddings),
-                ", ".join(restored_embeddings),
-            )
-
-        incompatible = instance.load_state_dict(mapped_sd, strict=False)
-        unexpected_keys = incompatible.unexpected_keys
-
-        unexpected_fatal = list(unexpected_keys)
-        if unexpected_fatal:
-            raise RuntimeError(
-                "Checkpoint loading failed.\n"
-                f"Unexpected keys: {unexpected_fatal}"
-            )
-
-        assert_checkpoint_covers_parameters(
-            instance, mapped_sd, source=str(pretrained_name_or_path)
-        )
-
-        instance.to(config.device)
-        instance.eval()
-
-        if getattr(config, "fuse_qkv", True):
-            instance.model.init_qkv_fusion_from_existing()
-        if getattr(config, "fuse_gate_up", True):
-            instance.model.init_mlp_fusion_from_existing()
-
-        return instance
+        return model
 
     def reset(self):
         """Reset action queue. Call when environment resets."""
