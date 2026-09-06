@@ -1,155 +1,204 @@
-"""Alias handling in load_remapped_checkpoint across the checkpoint layouts PI0.5 sees.
+"""PI0.5 checkpoint loading: one state_dict name per parameter, and every supported
+file layout renames exactly onto that name set.
 
-The toy mirrors the real trees: ``vlm``/``action_expert`` each own ``model.embed_tokens``
-and ``lm_head`` (tied in FlashVLA, untied in the baseline), ``prefix_embedder.lang_embedder``
-is the VLM embedding module under a second name, and the joint layer aliases the backbone
-layers. Three file layouts are exercised: an FSDP2 export that wrote every alias (with a
-stale ``lm_head``), a safetensors ``save_model`` export that kept one alphabetical name per
-tensor, and a raw openpi base that carries only ``lm_head`` keys.
+Policies are built on the meta device (no weights), so these tests check names
+and shapes only. Value-level checks against real checkpoints are done with the
+GPU/CPU verification scripts.
 """
 from __future__ import annotations
 
-import tempfile
 import unittest
-from pathlib import Path
 
 import torch
-from safetensors.torch import save_file, save_model
-from torch import nn
+from lerobot.configs.types import FeatureType, PolicyFeature
 
-from flashvla.policies.loading import load_remapped_checkpoint
+from flashvla.policies.loading import PI05_VLM_EMBED_KEY, PI05_VLM_HEAD_KEY, remap_pi05_state_dict
+from flashvla.policies.pi05.configuration_pi05 import PI05Config, PI05FlashVLAConfig
+from flashvla.policies.pi05.convert_legacy_checkpoint import EXPERT_EMBED_KEY, convert_legacy_state_dict
+from flashvla.policies.pi05.modeling_pi05 import PI05Policy
+from flashvla.policies.pi05.modeling_pi05_flashvla import PI05FlashVLAPolicy
 
-RAW_RULES = [
-    ("paligemma_with_expert.gemma_expert.", "model.action_expert."),
-    ("paligemma_with_expert.paligemma.", "model.vlm."),
-]
+# Distinct key patterns of lerobot/pi05_base (812 tensors); N is a layer index.
+RAW_PATTERNS = """
+action_in_proj.bias
+action_in_proj.weight
+action_out_proj.bias
+action_out_proj.weight
+paligemma_with_expert.gemma_expert.lm_head.weight
+paligemma_with_expert.gemma_expert.model.layers.N.input_layernorm.dense.bias
+paligemma_with_expert.gemma_expert.model.layers.N.input_layernorm.dense.weight
+paligemma_with_expert.gemma_expert.model.layers.N.mlp.down_proj.weight
+paligemma_with_expert.gemma_expert.model.layers.N.mlp.gate_proj.weight
+paligemma_with_expert.gemma_expert.model.layers.N.mlp.up_proj.weight
+paligemma_with_expert.gemma_expert.model.layers.N.post_attention_layernorm.dense.bias
+paligemma_with_expert.gemma_expert.model.layers.N.post_attention_layernorm.dense.weight
+paligemma_with_expert.gemma_expert.model.layers.N.self_attn.k_proj.weight
+paligemma_with_expert.gemma_expert.model.layers.N.self_attn.o_proj.weight
+paligemma_with_expert.gemma_expert.model.layers.N.self_attn.q_proj.weight
+paligemma_with_expert.gemma_expert.model.layers.N.self_attn.v_proj.weight
+paligemma_with_expert.gemma_expert.model.norm.dense.bias
+paligemma_with_expert.gemma_expert.model.norm.dense.weight
+paligemma_with_expert.paligemma.lm_head.weight
+paligemma_with_expert.paligemma.model.language_model.layers.N.input_layernorm.weight
+paligemma_with_expert.paligemma.model.language_model.layers.N.mlp.down_proj.weight
+paligemma_with_expert.paligemma.model.language_model.layers.N.mlp.gate_proj.weight
+paligemma_with_expert.paligemma.model.language_model.layers.N.mlp.up_proj.weight
+paligemma_with_expert.paligemma.model.language_model.layers.N.post_attention_layernorm.weight
+paligemma_with_expert.paligemma.model.language_model.layers.N.self_attn.k_proj.weight
+paligemma_with_expert.paligemma.model.language_model.layers.N.self_attn.o_proj.weight
+paligemma_with_expert.paligemma.model.language_model.layers.N.self_attn.q_proj.weight
+paligemma_with_expert.paligemma.model.language_model.layers.N.self_attn.v_proj.weight
+paligemma_with_expert.paligemma.model.language_model.norm.weight
+paligemma_with_expert.paligemma.model.multi_modal_projector.linear.bias
+paligemma_with_expert.paligemma.model.multi_modal_projector.linear.weight
+paligemma_with_expert.paligemma.model.vision_tower.vision_model.embeddings.patch_embedding.bias
+paligemma_with_expert.paligemma.model.vision_tower.vision_model.embeddings.patch_embedding.weight
+paligemma_with_expert.paligemma.model.vision_tower.vision_model.embeddings.position_embedding.weight
+paligemma_with_expert.paligemma.model.vision_tower.vision_model.encoder.layers.N.layer_norm1.bias
+paligemma_with_expert.paligemma.model.vision_tower.vision_model.encoder.layers.N.layer_norm1.weight
+paligemma_with_expert.paligemma.model.vision_tower.vision_model.encoder.layers.N.layer_norm2.bias
+paligemma_with_expert.paligemma.model.vision_tower.vision_model.encoder.layers.N.layer_norm2.weight
+paligemma_with_expert.paligemma.model.vision_tower.vision_model.encoder.layers.N.mlp.fc1.bias
+paligemma_with_expert.paligemma.model.vision_tower.vision_model.encoder.layers.N.mlp.fc1.weight
+paligemma_with_expert.paligemma.model.vision_tower.vision_model.encoder.layers.N.mlp.fc2.bias
+paligemma_with_expert.paligemma.model.vision_tower.vision_model.encoder.layers.N.mlp.fc2.weight
+paligemma_with_expert.paligemma.model.vision_tower.vision_model.encoder.layers.N.self_attn.k_proj.bias
+paligemma_with_expert.paligemma.model.vision_tower.vision_model.encoder.layers.N.self_attn.k_proj.weight
+paligemma_with_expert.paligemma.model.vision_tower.vision_model.encoder.layers.N.self_attn.out_proj.bias
+paligemma_with_expert.paligemma.model.vision_tower.vision_model.encoder.layers.N.self_attn.out_proj.weight
+paligemma_with_expert.paligemma.model.vision_tower.vision_model.encoder.layers.N.self_attn.q_proj.bias
+paligemma_with_expert.paligemma.model.vision_tower.vision_model.encoder.layers.N.self_attn.q_proj.weight
+paligemma_with_expert.paligemma.model.vision_tower.vision_model.encoder.layers.N.self_attn.v_proj.bias
+paligemma_with_expert.paligemma.model.vision_tower.vision_model.encoder.layers.N.self_attn.v_proj.weight
+paligemma_with_expert.paligemma.model.vision_tower.vision_model.post_layernorm.bias
+paligemma_with_expert.paligemma.model.vision_tower.vision_model.post_layernorm.weight
+time_mlp_in.bias
+time_mlp_in.weight
+time_mlp_out.bias
+time_mlp_out.weight
+""".split()
+LANG_EMBEDDER_KEY = "model.prefix_embedder.lang_embedder.weight"
+EXPERT_HEAD_KEY = "model.action_expert.lm_head.weight"
 
 
-class _Backbone(nn.Module):
-    def __init__(self, vocab: int, dim: int, tie: bool) -> None:
-        super().__init__()
-        self.model = nn.Module()
-        self.model.embed_tokens = nn.Embedding(vocab, dim)
-        self.model.layers = nn.ModuleList([nn.Linear(dim, dim, bias=False)])
-        self.lm_head = nn.Linear(dim, vocab, bias=False)
-        if tie:
-            self.lm_head.weight = self.model.embed_tokens.weight
-
-    def get_input_embeddings(self) -> nn.Module:
-        return self.model.embed_tokens
+def raw_openpi_keys() -> list[str]:
+    keys = []
+    for pattern in RAW_PATTERNS:
+        if ".N." not in pattern:
+            keys.append(pattern)
+            continue
+        depth = 27 if "vision_tower" in pattern else 18
+        keys.extend(pattern.replace(".N.", f".{i}.") for i in range(depth))
+    return keys
 
 
-class _Policy(nn.Module):
-    def __init__(self, tie: bool) -> None:
-        super().__init__()
-        self.model = nn.Module()
-        self.model.vlm = _Backbone(8, 4, tie)
-        self.model.action_expert = _Backbone(8, 2, tie)
-        self.model.prefix_embedder = nn.Module()
-        self.model.prefix_embedder.lang_embedder = self.model.vlm.model.embed_tokens
-        self.model.layers = nn.ModuleList([nn.Module()])
-        self.model.layers[0].vlm_layer = self.model.vlm.model.layers[0]
-        self.model.layers[0].expert_layer = self.model.action_expert.model.layers[0]
-        self.model.out = nn.Linear(2, 3)
-
-    def embed(self) -> torch.Tensor:
-        return self.model.vlm.model.embed_tokens.weight
+def _config(config_cls):
+    config = config_cls()
+    config.input_features = {
+        f"observation.images.{cam}": PolicyFeature(type=FeatureType.VISUAL, shape=(3, 224, 224))
+        for cam in ("a", "b", "c")
+    }
+    config.input_features["observation.state"] = PolicyFeature(type=FeatureType.STATE, shape=(14,))
+    config.output_features = {"action": PolicyFeature(type=FeatureType.ACTION, shape=(14,))}
+    config.device = "cpu"
+    config.compile_model = False
+    return config
 
 
-def _trained(tie: bool) -> _Policy:
-    torch.manual_seed(0)
-    policy = _Policy(tie)
-    with torch.no_grad():
-        policy.model.vlm.model.embed_tokens.weight.fill_(7.0)
-        policy.model.action_expert.model.embed_tokens.weight.fill_(5.0)
-        if not tie:  # the baseline's dead heads keep their pretrained value
-            policy.model.vlm.lm_head.weight.fill_(-1.0)
-            policy.model.action_expert.lm_head.weight.fill_(-1.0)
-    return policy
+def _fake(keys) -> dict[str, torch.Tensor]:
+    return {key: torch.full((1,), float(i)) for i, key in enumerate(keys)}
 
 
-class AliasLoadingTest(unittest.TestCase):
-    def setUp(self) -> None:
-        self.tmp = tempfile.TemporaryDirectory()
-        self.dir = Path(self.tmp.name)
+class PI05LoadingTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        with torch.device("meta"):
+            cls.policies = {
+                "pi05": PI05Policy(_config(PI05Config)),
+                "pi05-flashvla": PI05FlashVLAPolicy(_config(PI05FlashVLAConfig)),
+            }
+        cls.names = set(cls.policies["pi05"].state_dict())
 
-    def tearDown(self) -> None:
-        self.tmp.cleanup()
+    def test_every_parameter_has_exactly_one_name(self) -> None:
+        for kind, policy in self.policies.items():
+            with self.subTest(kind):
+                all_names = [name for name, _ in policy.named_parameters(remove_duplicate=False)]
+                unique = {id(p) for _, p in policy.named_parameters(remove_duplicate=False)}
+                state = policy.state_dict()
+                self.assertEqual(len(all_names), len(unique))
+                self.assertEqual(set(all_names), set(state))  # no persistent buffers either
+                self.assertNotIn(LANG_EMBEDDER_KEY, state)
+                self.assertNotIn(EXPERT_EMBED_KEY, state)
+                self.assertIn(PI05_VLM_EMBED_KEY, state)
+                self.assertIn(PI05_VLM_HEAD_KEY, state)
+                self.assertIn(EXPERT_HEAD_KEY, state)
+                self.assertEqual(set(state), self.names)
+                self.assertEqual(len(state), 813)
 
-    def _load(self, name: str, tie: bool, rules=()) -> _Policy:
-        policy = _Policy(tie)
-        load_remapped_checkpoint(policy, str(self.dir / name), rules, source=name)
-        return policy
+    def test_raw_openpi_layout_maps_exactly(self) -> None:
+        remapped = remap_pi05_state_dict(_fake(raw_openpi_keys()))
+        self.assertEqual(set(remapped), self.names)
+        # The base stores the tied VLM embedding as its lm_head only.
+        self.assertIs(remapped[PI05_VLM_EMBED_KEY], remapped[PI05_VLM_HEAD_KEY])
 
-    def _fsdp_export(self) -> str:
-        # Every alias as its own tensor, backbone layer aliases already detached,
-        # and the dormant lm_head holding a stale value.
-        sd = {k: v.detach().clone() for k, v in _trained(tie=True).state_dict().items()}
-        for k in [k for k in sd if ".model.layers." in k]:
-            del sd[k]
-        sd["model.vlm.lm_head.weight"].fill_(-100.0)
-        save_file(sd, str(self.dir / "fsdp.safetensors"))
-        return "fsdp.safetensors"
+    def test_lerobot_save_pretrained_layout_maps_exactly(self) -> None:
+        remapped = remap_pi05_state_dict(_fake("model." + key for key in raw_openpi_keys()))
+        self.assertEqual(set(remapped), self.names)
 
-    def _save_model(self, tie: bool) -> str:
-        name = f"save_model_{'tied' if tie else 'untied'}.safetensors"
-        save_model(_trained(tie), str(self.dir / name))
-        return name
+    def test_native_keys_pass_through_unchanged(self) -> None:
+        state = _fake(sorted(self.names))
+        remapped = remap_pi05_state_dict(state)
+        self.assertEqual(remapped.keys(), state.keys())
+        for key in state:
+            self.assertIs(remapped[key], state[key])
 
-    def _raw(self) -> str:
-        src = _trained(tie=True).state_dict()
-        sd = {
-            "paligemma_with_expert.paligemma.lm_head.weight": src["model.vlm.lm_head.weight"],
-            "paligemma_with_expert.paligemma.model.layers.0.weight": src["model.vlm.model.layers.0.weight"],
-            "paligemma_with_expert.gemma_expert.lm_head.weight": src["model.action_expert.lm_head.weight"],
-            "paligemma_with_expert.gemma_expert.model.layers.0.weight": src["model.action_expert.model.layers.0.weight"],
-            "model.out.weight": src["model.out.weight"],
-            "model.out.bias": src["model.out.bias"],
-        }
-        save_file({k: v.detach().clone() for k, v in sd.items()}, str(self.dir / "raw.safetensors"))
-        return "raw.safetensors"
+    def test_legacy_fsdp_export_converts(self) -> None:
+        # Every alias as its own tensor: lang_embedder equal to embed_tokens, a
+        # dead expert embedding, and a stale tied vlm.lm_head.
+        state = _fake(sorted(self.names))
+        state[LANG_EMBEDDER_KEY] = state[PI05_VLM_EMBED_KEY].clone()
+        state[EXPERT_EMBED_KEY] = torch.full((1,), 5.0)
+        state[PI05_VLM_HEAD_KEY] = torch.full((1,), -100.0)
+        converted = convert_legacy_state_dict(state, tied_heads=True)
+        self.assertEqual(set(converted), self.names)
+        self.assertTrue(torch.equal(converted[PI05_VLM_HEAD_KEY], state[PI05_VLM_EMBED_KEY]))
+        self.assertTrue(torch.equal(converted[EXPERT_HEAD_KEY], state[EXPERT_EMBED_KEY]))
 
-    def test_fsdp_export_prefers_trained_embedding_over_stale_head(self) -> None:
-        policy = self._load(self._fsdp_export(), tie=True)
-        self.assertTrue(torch.all(policy.embed() == 7.0))
-        self.assertIs(policy.model.vlm.lm_head.weight, policy.embed())
-        self.assertTrue(torch.all(policy.model.action_expert.model.embed_tokens.weight == 5.0))
+        state[LANG_EMBEDDER_KEY] = torch.full((1,), 42.0)
+        with self.assertRaisesRegex(ValueError, "different values"):
+            convert_legacy_state_dict(state, tied_heads=True)
 
-    def test_fsdp_export_into_untied_baseline(self) -> None:
-        policy = self._load(self._fsdp_export(), tie=False)
-        self.assertTrue(torch.all(policy.embed() == 7.0))
-        self.assertTrue(torch.all(policy.model.vlm.lm_head.weight == -100.0))
+    def test_legacy_save_pretrained_export_converts(self) -> None:
+        # safetensors kept one alphabetical-first name per tied/aliased tensor:
+        # lang_embedder instead of embed_tokens or vlm.lm_head, and the expert's
+        # backbone layer names instead of the joint-layer ones.
+        state = _fake(sorted(self.names))
+        state[LANG_EMBEDDER_KEY] = state.pop(PI05_VLM_EMBED_KEY)
+        del state[PI05_VLM_HEAD_KEY]
+        for key in [k for k in state if k.startswith("model.layers.")]:
+            depth, rest = key.split(".")[2], ".".join(key.split(".")[3:])
+            legacy = None
+            if rest.startswith("self_attn.action_expert_attention."):
+                legacy = f"model.action_expert.model.layers.{depth}.self_attn." + rest.split(".", 2)[2]
+            elif rest.startswith("mlp.action_expert_mlp."):
+                legacy = f"model.action_expert.model.layers.{depth}.mlp." + rest.split(".", 2)[2]
+            elif rest.split(".")[1] == "1":  # adaRMS norms of the expert
+                norm, _, tail = rest.split(".", 2)
+                legacy = f"model.action_expert.model.layers.{depth}.{norm}.{tail}"
+            if legacy:
+                state[legacy] = state.pop(key)
+        converted = convert_legacy_state_dict(state, tied_heads=True)
+        self.assertEqual(set(converted), self.names)
+        self.assertTrue(torch.equal(converted[PI05_VLM_HEAD_KEY], converted[PI05_VLM_EMBED_KEY]))
 
-    def test_save_model_exports_round_trip(self) -> None:
-        # (file tied, model untied) is excluded: a tied export carries no separate
-        # head tensor for the baseline's untied lm_head, so that cross-load fails
-        # the coverage check by design.
-        for file_tie, model_tie in ((True, True), (False, True), (False, False)):
-            with self.subTest(file_tie=file_tie, model_tie=model_tie):
-                policy = self._load(self._save_model(file_tie), tie=model_tie)
-                self.assertTrue(torch.all(policy.embed() == 7.0))
-                if not model_tie:
-                    self.assertTrue(torch.all(policy.model.vlm.lm_head.weight == -1.0))
-
-    def test_raw_base_fills_embeddings_from_heads(self) -> None:
-        for tie in (True, False):
-            with self.subTest(tie=tie):
-                policy = self._load(self._raw(), tie=tie, rules=RAW_RULES)
-                self.assertTrue(torch.all(policy.embed() == 7.0))
-                self.assertTrue(torch.all(policy.model.vlm.lm_head.weight == 7.0))
-
-    def test_missing_unexpected_and_shape_mismatch_are_fatal(self) -> None:
-        sd = {k: v.detach().clone() for k, v in _trained(tie=False).state_dict().items()}
-        cases = {
-            "missing": ({k: v for k, v in sd.items() if k != "model.out.bias"}, "random initialization"),
-            "unexpected": ({**sd, "model.bogus.weight": torch.zeros(1)}, "Unexpected keys"),
-            "shape": ({**sd, "model.out.bias": torch.zeros(5)}, "model.out.bias"),
-        }
-        for name, (state, message) in cases.items():
-            with self.subTest(name):
-                save_file(state, str(self.dir / f"{name}.safetensors"))
-                with self.assertRaisesRegex(RuntimeError, message):
-                    self._load(f"{name}.safetensors", tie=False)
+    def test_untied_legacy_export_keeps_its_heads(self) -> None:
+        state = _fake(sorted(self.names))
+        state[LANG_EMBEDDER_KEY] = state[PI05_VLM_EMBED_KEY].clone()
+        state[EXPERT_EMBED_KEY] = torch.full((1,), 5.0)
+        converted = convert_legacy_state_dict(state, tied_heads=False)
+        self.assertEqual(set(converted), self.names)
+        self.assertIs(converted[PI05_VLM_HEAD_KEY], state[PI05_VLM_HEAD_KEY])
+        self.assertIs(converted[EXPERT_HEAD_KEY], state[EXPERT_HEAD_KEY])
 
 
 if __name__ == "__main__":
