@@ -13,11 +13,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Checkpoint key spaces of the PI0 / PI0.5 policies.
+"""Checkpoint loading for the PI0 / PI0.5 policies.
 
-Both families register every parameter under exactly one state_dict name, so
-loading is lerobot's recipe: rename the openpi keys, then one strict
-``load_state_dict``. The tables below are the two directions of that rename.
+The policies use lerobot's parameter tree, so a lerobot or FlashVLA checkpoint
+loads with one strict ``load_state_dict``. Only openpi's raw exports (the
+``lerobot/pi0_base`` and ``lerobot/pi05_base`` files) need the same few fixes
+lerobot's ``_fix_pytorch_state_dict_keys`` applies.
 """
 
 from __future__ import annotations
@@ -27,95 +28,79 @@ from collections.abc import Iterable
 
 from torch import Tensor, nn
 
-# openpi / lerobot -> flashvla ---------------------------------------------------
-#
-# The joint layer at depth N owns the VLM and action-expert sublayers of that
-# depth side by side, which is where the two backbone layer stacks land.
-# lerobot's ``save_pretrained`` nests the openpi names under ``model.``; the
-# optional prefix covers both spellings. Keys this package wrote already carry
-# the final names and fall through every rule unchanged.
-_VLM_LAYER = r"^(?:model\.)?paligemma_with_expert\.paligemma\.model\.language_model\.layers\.(\d+)\."
-_EXPERT_LAYER = r"^(?:model\.)?paligemma_with_expert\.gemma_expert\.model\.layers\.(\d+)\."
-_BACKBONE_RULES: tuple[tuple[str, str], ...] = (
-    (_VLM_LAYER + r"self_attn\.", r"model.layers.\1.self_attn.vlm_attention."),
-    (_VLM_LAYER + r"mlp\.", r"model.layers.\1.mlp.vlm_mlp."),
-    (_VLM_LAYER + r"(input_layernorm|post_attention_layernorm)\.", r"model.layers.\1.\2.0."),
-    (_EXPERT_LAYER + r"self_attn\.", r"model.layers.\1.self_attn.action_expert_attention."),
-    (_EXPERT_LAYER + r"mlp\.", r"model.layers.\1.mlp.action_expert_mlp."),
-    (_EXPERT_LAYER + r"(input_layernorm|post_attention_layernorm)\.", r"model.layers.\1.\2.1."),
-    (r"^(?:model\.)?paligemma_with_expert\.paligemma\.", "model.vlm."),
-    (r"^(?:model\.)?paligemma_with_expert\.gemma_expert\.", "model.action_expert."),
-    (r"^(?:model\.)?action_out_proj\.", "model.action_out_proj."),
-)
-PI05_KEY_RULES: tuple[tuple[str, str], ...] = _BACKBONE_RULES + (
-    (r"^(?:model\.)?(action_in_proj|time_mlp_in|time_mlp_out)\.", r"model.suffix_embedder.\1."),
-)
-PI0_KEY_RULES: tuple[tuple[str, str], ...] = _BACKBONE_RULES + (
-    (
-        r"^(?:model\.)?(action_in_proj|state_proj|action_time_mlp_in|action_time_mlp_out)\.",
-        r"model.suffix_embedder.\1.",
-    ),
-    # Older openpi pi0 exports spell the time MLP without the ``action_`` prefix.
-    (r"^(?:model\.)?time_mlp_(in|out)\.", r"model.suffix_embedder.action_time_mlp_\1."),
-)
-VLM_EMBED_KEY = "model.vlm.model.language_model.embed_tokens.weight"
-VLM_HEAD_KEY = "model.vlm.lm_head.weight"
+PALIGEMMA = "model.paligemma_with_expert.paligemma."
+GEMMA_EXPERT = "model.paligemma_with_expert.gemma_expert."
+VLM_EMBED_KEY = PALIGEMMA + "model.language_model.embed_tokens.weight"
+VLM_HEAD_KEY = PALIGEMMA + "lm_head.weight"
+EXPERT_HEAD_KEY = GEMMA_EXPERT + "lm_head.weight"
 
-# Names only a checkpoint from before the alias-free layout can contain.
-_PRE_ALIAS_FREE_MARKERS = (
-    "model.prefix_embedder.lang_embedder.",
-    "model.action_expert.model.embed_tokens.",
-    "model.action_expert.model.layers.",
-    "model.vlm.model.language_model.layers.",
+_EXPERT_NORM_SCALE = re.compile(
+    r"^paligemma_with_expert\.gemma_expert\.model\.(layers\.\d+\.(input_layernorm|post_attention_layernorm)|norm)\.weight$"
+)
+# Names only a FlashVLA checkpoint from before the lerobot tree can contain.
+_PRE_LEROBOT_TREE_MARKERS = (
+    "model.layers.",
+    "model.vlm.",
+    "model.action_expert.",
+    "model.suffix_embedder.",
+    "model.prefix_embedder.",
 )
 
 
-def _rename(state_dict: dict[str, Tensor], rules: Iterable[tuple[str, str]]) -> dict[str, Tensor]:
-    rules = tuple(rules)
-    renamed: dict[str, Tensor] = {}
+def fix_openpi_state_dict(
+    state_dict: dict[str, Tensor], kind: str, *, adarms_expert: bool = False
+) -> dict[str, Tensor]:
+    """Bring a raw openpi export into lerobot's ``model.``-prefixed key space.
+
+    Mirrors lerobot's ``_fix_pytorch_state_dict_keys``: keys that already carry
+    the ``model.`` prefix (lerobot or FlashVLA saves) pass through untouched.
+    Raw keys get the prefix; PI0.5 reads openpi's ``action_time_mlp_*`` as
+    ``time_mlp_*`` and has no ``state_proj``; PI0 reads ``time_mlp_*`` as
+    ``action_time_mlp_*``; an adaRMS action expert has no plain norm scales, so
+    those are skipped. openpi ties the VLM input embedding to its lm_head and
+    stores the head only, so the embedding is copied from it when absent.
+    """
+    if kind not in ("pi0", "pi05"):
+        raise ValueError(f"kind must be 'pi0' or 'pi05', got {kind!r}")
+    fixed: dict[str, Tensor] = {}
     for key, value in state_dict.items():
-        for pattern, replacement in rules:
-            key, count = re.subn(pattern, replacement, key, count=1)
-            if count:
-                break
-        renamed[key] = value
-    return renamed
-
-
-def remap_state_dict(state_dict: dict[str, Tensor], rules: Iterable[tuple[str, str]]) -> dict[str, Tensor]:
-    """Rename an openpi/lerobot checkpoint into this package's key space."""
-    remapped = _rename(state_dict, rules)
-    # openpi ties the VLM input embedding to its lm_head and stores the head only.
-    if VLM_EMBED_KEY not in remapped and VLM_HEAD_KEY in remapped:
-        remapped[VLM_EMBED_KEY] = remapped[VLM_HEAD_KEY]
-    return remapped
+        if not key.startswith("model."):
+            if kind == "pi05":
+                if key.startswith("state_proj."):
+                    continue
+                key = re.sub(r"^action_time_mlp_(in|out)\.", r"time_mlp_\1.", key)
+            else:
+                key = re.sub(r"^time_mlp_(in|out)\.", r"action_time_mlp_\1.", key)
+            if adarms_expert and _EXPERT_NORM_SCALE.match(key):
+                continue
+            key = "model." + key
+        fixed[key] = value
+    if VLM_EMBED_KEY not in fixed and VLM_HEAD_KEY in fixed:
+        fixed[VLM_EMBED_KEY] = fixed[VLM_HEAD_KEY]
+    return fixed
 
 
 def load_checkpoint(
     model: nn.Module,
     model_file: str,
-    rules: Iterable[tuple[str, str]],
     *,
-    drop: Iterable[str] = (),
+    kind: str,
+    adarms_expert: bool = False,
     fresh: Iterable[str] = (),
 ) -> list[str]:
-    """Fill ``model`` from ``model.safetensors``: rename, then one strict load.
+    """Fill ``model`` from ``model.safetensors`` with one strict load.
 
-    ``drop`` holds regexes for renamed keys the model has no place for (an
-    adaRMS expert has no plain norm scales); ``fresh`` holds regexes for
-    parameters the file may leave at their initialization (the projections
-    such a file lacks). The names actually left fresh are returned; any other
-    missing or unexpected key is an error. The file is read on the CPU (every
-    rank of a distributed job shares one default GPU at this point); the
-    caller moves the policy afterwards.
+    ``fresh`` holds regexes for parameters the file may leave at their
+    initialization (the adaRMS projections a plain PI0 base cannot provide);
+    the names actually left fresh are returned. Any other missing or
+    unexpected key is an error. The file is read on the CPU (every rank of a
+    distributed job shares one default GPU at this point); the caller moves
+    the policy afterwards.
     """
     from safetensors.torch import load_file
 
-    drop, fresh = tuple(drop), tuple(fresh)
-    state_dict = remap_state_dict(load_file(model_file), rules)
-    if drop:
-        state_dict = {k: v for k, v in state_dict.items() if not any(re.match(p, k) for p in drop)}
-
+    fresh = tuple(fresh)
+    state_dict = fix_openpi_state_dict(load_file(model_file), kind, adarms_expert=adarms_expert)
     result = model.load_state_dict(state_dict, strict=False)
     missing = [k for k in result.missing_keys if not any(re.match(p, k) for p in fresh)]
     if missing or result.unexpected_keys:
@@ -125,63 +110,21 @@ def load_checkpoint(
         if result.unexpected_keys:
             detail.append(f"unexpected {len(result.unexpected_keys)}: {result.unexpected_keys[:8]}")
         message = f"{model_file} does not match {type(model).__name__}: " + "; ".join(detail)
-        if any(key.startswith(_PRE_ALIAS_FREE_MARKERS) for key in state_dict):
+        if any(key.startswith(_PRE_LEROBOT_TREE_MARKERS) for key in state_dict):
             message += (
-                ". The file was saved before the alias-free layout; convert it once with "
+                ". The file uses FlashVLA's former parameter names; convert it once with "
                 "`python -m flashvla.policies.pi05.convert_legacy_checkpoint <src_dir> <dst_dir>`"
             )
         raise RuntimeError(message)
     return list(result.missing_keys)
 
 
-def load_pi05_checkpoint(model: nn.Module, model_file: str) -> None:
-    load_checkpoint(model, model_file, PI05_KEY_RULES)
-
-
-def load_pi0_checkpoint(
-    model: nn.Module, model_file: str, *, drop: Iterable[str] = (), fresh: Iterable[str] = ()
-) -> list[str]:
-    return load_checkpoint(model, model_file, PI0_KEY_RULES, drop=drop, fresh=fresh)
-
-
-# flashvla -> lerobot 0.5.1 --------------------------------------------------------
-#
-# The inverse of the tables above, producing the ``model.``-prefixed layout that
-# lerobot's own ``save_pretrained`` writes. Whether the result is complete for a
-# given lerobot policy is the exporter's job (see export_lerobot_checkpoint).
-_JOINT = r"^model\.layers\.(\d+)\."
-_PALIGEMMA = "model.paligemma_with_expert.paligemma."
-_EXPERT = "model.paligemma_with_expert.gemma_expert."
-LEROBOT_KEY_RULES: tuple[tuple[str, str], ...] = (
-    (_JOINT + r"self_attn\.vlm_attention\.", _PALIGEMMA + r"model.language_model.layers.\1.self_attn."),
-    (_JOINT + r"mlp\.vlm_mlp\.", _PALIGEMMA + r"model.language_model.layers.\1.mlp."),
-    (
-        _JOINT + r"(input_layernorm|post_attention_layernorm)\.0\.",
-        _PALIGEMMA + r"model.language_model.layers.\1.\2.",
-    ),
-    (_JOINT + r"self_attn\.action_expert_attention\.", _EXPERT + r"model.layers.\1.self_attn."),
-    (_JOINT + r"mlp\.action_expert_mlp\.", _EXPERT + r"model.layers.\1.mlp."),
-    (_JOINT + r"(input_layernorm|post_attention_layernorm)\.1\.", _EXPERT + r"model.layers.\1.\2."),
-    (r"^model\.vlm\.", _PALIGEMMA),
-    (r"^model\.action_expert\.", _EXPERT),
-    (r"^model\.suffix_embedder\.", "model."),
-)
-
-
-def to_lerobot_state_dict(state_dict: dict[str, Tensor]) -> dict[str, Tensor]:
-    """Rename a flashvla PI0 / PI0.5 state dict into lerobot 0.5.1's key space."""
-    return _rename(state_dict, LEROBOT_KEY_RULES)
-
-
 __all__ = [
-    "PI05_KEY_RULES",
-    "PI0_KEY_RULES",
-    "LEROBOT_KEY_RULES",
+    "PALIGEMMA",
+    "GEMMA_EXPERT",
     "VLM_EMBED_KEY",
     "VLM_HEAD_KEY",
-    "remap_state_dict",
+    "EXPERT_HEAD_KEY",
+    "fix_openpi_state_dict",
     "load_checkpoint",
-    "load_pi05_checkpoint",
-    "load_pi0_checkpoint",
-    "to_lerobot_state_dict",
 ]

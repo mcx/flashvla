@@ -13,22 +13,22 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Write a flashvla PI0 / PI0.5 checkpoint in lerobot 0.5.1's layout::
+"""Give a FlashVLA PI0 / PI0.5 checkpoint a config stock lerobot 0.5.1 can read::
 
     python -m flashvla.policies.export_lerobot_checkpoint <src pretrained_model> <dst_dir>
 
-``dst_dir`` receives ``model.safetensors`` under lerobot's
-``model.paligemma_with_expert.*`` names, a ``config.json`` of the matching
+The parameter tree is already lerobot's, so ``model.safetensors`` is copied
+unchanged. What lerobot cannot read is FlashVLA's ``config.json`` (its own
+``type`` and extra fields), so ``dst_dir`` gets a ``config.json`` of the matching
 lerobot type (``pi05`` or ``pi0``) holding the fields the two configs share,
-and copies of the other files (processors, README), so stock lerobot can
-``PI05Policy.from_pretrained(dst_dir)`` it. The exported names and shapes are
-checked against lerobot's own model built on the meta device.
+plus copies of the other files (processors, README). The tensor names and shapes
+are checked against lerobot's own model built on the meta device.
 
 A streaming (``*-flashvla``) checkpoint exports as a plain lerobot policy: the
 weights load, but they were trained under FlashVLA's buffered action schedule,
 so lerobot's synchronous denoising does not reproduce FlashVLA's behavior. PI0
 checkpoints trained with ``use_adarms_time_cond`` cannot be exported because
-lerobot's PI0 has no adaRMS expert; the check below names the offending keys.
+lerobot's PI0 has no adaRMS expert; the check names the offending keys.
 """
 
 from __future__ import annotations
@@ -44,9 +44,7 @@ from pathlib import Path
 
 import draccus
 import torch
-from safetensors.torch import load_file, save_file
-
-from flashvla.policies.loading import to_lerobot_state_dict
+from safetensors.torch import load_file
 
 LEROBOT_TYPES = {"pi05": "pi05", "pi05-flashvla": "pi05", "pi0": "pi0", "pi0-flashvla": "pi0"}
 
@@ -133,26 +131,23 @@ def export_pretrained_dir(src: Path, dst: Path) -> None:
     if flashvla_config.get("type") not in LEROBOT_TYPES:
         raise ValueError(f"{src}: type {flashvla_config.get('type')!r} has no lerobot counterpart")
     if src.resolve() == dst.resolve():
-        raise ValueError("dst must differ from src; the export is a second copy, not a conversion in place")
+        raise ValueError("dst must differ from src; the export is a second copy with lerobot's config")
 
     config = lerobot_config_dict(flashvla_config)
     dst.mkdir(parents=True, exist_ok=True)
     (dst / "config.json").write_text(json.dumps(config, indent=4) + "\n")
 
-    state_dict = to_lerobot_state_dict(load_file(str(src / "model.safetensors")))
+    state_dict = load_file(str(src / "model.safetensors"))
     check_against_lerobot(state_dict, expected_lerobot_shapes(dst / "config.json", config["type"]))
 
     for item in src.iterdir():
-        if item.name in ("model.safetensors", "config.json"):
+        if item.name == "config.json":
             continue
         if item.is_dir():
             shutil.copytree(item, dst / item.name, dirs_exist_ok=True)
         else:
             shutil.copy2(item, dst / item.name)
-    tmp = dst / "model.safetensors.tmp"
-    save_file(state_dict, str(tmp), metadata={"format": "pt"})
-    os.replace(tmp, dst / "model.safetensors")
-    print(f"wrote {dst}: lerobot type {config['type']}, {len(state_dict)} tensors")
+    print(f"wrote {dst}: lerobot type {config['type']}, {len(state_dict)} tensors copied unchanged")
 
 
 def main() -> None:

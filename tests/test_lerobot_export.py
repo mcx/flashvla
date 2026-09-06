@@ -1,8 +1,5 @@
-"""The lerobot-layout export matches what stock lerobot 0.5.1 builds, name for name.
-
-Both lerobot policies are built on the meta device from a config derived the way
-the exporter derives it, so this checks the key sets and shapes without weights.
-"""
+"""The lerobot-config export: stock lerobot 0.5.1 must accept the config and the
+(unchanged) tensors of a FlashVLA checkpoint."""
 from __future__ import annotations
 
 import json
@@ -18,7 +15,6 @@ from flashvla.policies.export_lerobot_checkpoint import (
     expected_lerobot_shapes,
     lerobot_config_dict,
 )
-from flashvla.policies.loading import to_lerobot_state_dict
 from flashvla.policies.pi0.configuration_pi0 import PI0Config, PI0FlashVLAConfig
 from flashvla.policies.pi0.modeling_pi0 import PI0Policy
 from flashvla.policies.pi0.modeling_pi0_flashvla import PI0FlashVLAPolicy
@@ -50,33 +46,30 @@ class LerobotExportTest(unittest.TestCase):
             lerobot_config = lerobot_config_dict(flashvla_config)
             (Path(tmp) / "lerobot.json").write_text(json.dumps(lerobot_config))
             expected = expected_lerobot_shapes(Path(tmp) / "lerobot.json", lerobot_config["type"])
-        exported = to_lerobot_state_dict({k: v for k, v in policy.state_dict().items()})
-        return lerobot_config, exported, expected
+        return lerobot_config, dict(policy.state_dict()), expected
 
-    def test_pi05_exports_match_lerobot(self) -> None:
+    def test_pi05_configs_and_tensors_are_accepted(self) -> None:
         for policy_cls, config_cls in ((PI05Policy, PI05Config), (PI05FlashVLAPolicy, PI05FlashVLAConfig)):
             with self.subTest(policy_cls.__name__):
-                lerobot_config, exported, expected = self._exported(policy_cls, _config(config_cls))
+                lerobot_config, state, expected = self._exported(policy_cls, _config(config_cls))
                 self.assertEqual(lerobot_config["type"], "pi05")
                 self.assertNotIn("num_buffer_slots", lerobot_config)
-                self.assertEqual(lerobot_config["input_features"].keys(), {"observation.images.a", "observation.images.b", "observation.state"})
-                check_against_lerobot(exported, expected)  # raises on any name/shape difference
-                self.assertEqual(len(exported), 813)
+                self.assertNotIn("pretrained_path", lerobot_config)
+                check_against_lerobot(state, expected)  # raises on any name/shape difference
+                self.assertEqual(len(state), 813)
 
-    def test_pi0_exports_match_lerobot(self) -> None:
+    def test_pi0_configs_and_tensors_are_accepted(self) -> None:
         for policy_cls, config_cls in ((PI0Policy, PI0Config), (PI0FlashVLAPolicy, PI0FlashVLAConfig)):
             with self.subTest(policy_cls.__name__):
-                lerobot_config, exported, expected = self._exported(policy_cls, _config(config_cls))
+                lerobot_config, state, expected = self._exported(policy_cls, _config(config_cls))
                 self.assertEqual(lerobot_config["type"], "pi0")
-                check_against_lerobot(exported, expected)
-                self.assertEqual(len(exported), 778)
+                check_against_lerobot(state, expected)
+                self.assertEqual(len(state), 778)
 
     def test_adarms_pi0_is_refused(self) -> None:
-        _, exported, expected = self._exported(
-            PI0FlashVLAPolicy, _config(PI0FlashVLAConfig, use_adarms_time_cond=True)
-        )
+        _, state, expected = self._exported(PI0FlashVLAPolicy, _config(PI0FlashVLAConfig, use_adarms_time_cond=True))
         with self.assertRaisesRegex(ValueError, "does not match lerobot"):
-            check_against_lerobot(exported, expected)
+            check_against_lerobot(state, expected)
 
 
 if __name__ == "__main__":

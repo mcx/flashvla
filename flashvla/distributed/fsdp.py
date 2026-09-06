@@ -21,6 +21,7 @@ class FSDPWrapReport:
     """Summary of the communication groups created for one policy."""
 
     compute_modules: tuple[str, ...]
+    compute_groups: tuple[str, ...]
     fp32_modules: tuple[str, ...]
     fp32_output_modules: tuple[str, ...]
     trainable_parameters: int
@@ -37,6 +38,11 @@ class FSDPModulePlan:
     """Resolved module objects for a policy's FSDP2 communication groups."""
 
     compute_modules: tuple[_NamedModule, ...]
+    # Named groups of leaf modules sharded together as one communication unit
+    # (``fully_shard`` accepts a list): FlashVLA's joint layers call the
+    # decoder projections of both backbones directly, so the projections of
+    # one depth form a group instead of a wrapper module.
+    compute_groups: tuple[tuple[str, tuple[_NamedModule, ...]], ...]
     fp32_modules: tuple[_NamedModule, ...]
     fp32_output_modules: tuple[_NamedModule, ...]
 
@@ -147,6 +153,33 @@ def build_fsdp_module_plan(policy: nn.Module, mixed_precision: str) -> FSDPModul
     )
     compute_modules.sort(key=lambda item: item.name.count("."), reverse=True)
 
+    name_by_module_id = {id(item.module): item.name for item in named_modules}
+    claimed_parameter_ids = {
+        id(parameter)
+        for item in [*fp32_modules, *compute_modules]
+        for parameter in item.module.parameters()
+    }
+    compute_groups: list[tuple[str, tuple[_NamedModule, ...]]] = []
+    group_source = getattr(policy, "fsdp_compute_groups", None)
+    for group_name, modules in (group_source() if callable(group_source) else ()):
+        members = []
+        for module in modules:
+            member_name = name_by_module_id.get(id(module))
+            if member_name is None:
+                raise ValueError(
+                    f"FSDP2 plan for {type(policy).__name__}: group {group_name!r} names a module "
+                    "that is not registered on the policy"
+                )
+            for parameter in module.parameters():
+                if id(parameter) in claimed_parameter_ids:
+                    raise ValueError(
+                        f"FSDP2 plan for {type(policy).__name__}: {member_name} of group "
+                        f"{group_name!r} is already covered by another communication unit"
+                    )
+                claimed_parameter_ids.add(id(parameter))
+            members.append(_NamedModule(name=member_name, module=module))
+        compute_groups.append((group_name, tuple(members)))
+
     missing_wrap_classes = wrap_class_names - set(module_class_name.values())
     if missing_wrap_classes:
         raise ValueError(
@@ -191,6 +224,7 @@ def build_fsdp_module_plan(policy: nn.Module, mixed_precision: str) -> FSDPModul
     )
     return FSDPModulePlan(
         compute_modules=tuple(compute_modules),
+        compute_groups=tuple(compute_groups),
         fp32_modules=tuple(fp32_modules),
         fp32_output_modules=fp32_output_modules,
     )
@@ -280,6 +314,8 @@ def fully_shard_policy(
 
     for item in plan.compute_modules:
         fully_shard(item.module, mp_policy=main_policy, **common_kwargs)
+    for _group_name, members in plan.compute_groups:
+        fully_shard([item.module for item in members], mp_policy=main_policy, **common_kwargs)
 
     root_policy = MixedPrecisionPolicy(
         param_dtype=main_policy.param_dtype,
@@ -311,6 +347,9 @@ def fully_shard_policy(
 
     return FSDPWrapReport(
         compute_modules=tuple(item.name for item in plan.compute_modules),
+        compute_groups=tuple(
+            f"{group_name} ({len(members)} modules)" for group_name, members in plan.compute_groups
+        ),
         fp32_modules=tuple(item.name for item in plan.fp32_modules),
         fp32_output_modules=tuple(item.name for item in plan.fp32_output_modules),
         trainable_parameters=sum(

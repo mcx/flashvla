@@ -23,14 +23,18 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 from lerobot.policies.pi_gemma import (
-    PiGemmaForCausalLM as GemmaForCausalLM,
     PaliGemmaForConditionalGenerationWithPiGemma as PaliGemmaForConditionalGeneration,
     _gated_residual,
 )
 from lerobot.configs.policies import PreTrainedConfig, T
 from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.utils.constants import ACTION, OBS_STATE, OBS_LANGUAGE_TOKENS, OBS_LANGUAGE_ATTENTION_MASK
-from flashvla.policies.loading import load_pi0_checkpoint
+from flashvla.policies.loading import load_checkpoint
+from flashvla.policies.paligemma_with_expert import (
+    PaliGemmaWithExpert,
+    ProjectionRefs,
+    decoder_linear_groups,
+)
 from flashvla.policies.pi0.configuration_pi0 import PI0Config
 from flashvla.policies.pi0.utils import (
     create_sinusoidal_pos_embedding,
@@ -121,21 +125,14 @@ class PI0PrefixEmbedder(nn.Module):
         return embs, pad_masks, att_masks
 
 
-class PI0SuffixEmbedder(nn.Module):
+class PI0SuffixEmbedder(ProjectionRefs):
     """Embed state, noisy actions, and time for flow matching.
     
     """
     
-    def __init__(self, config: PI0Config):
-        super().__init__()
+    def __init__(self, config: PI0Config, projections):
+        super().__init__(projections)
         self.config = config
-
-        width = config.action_expert_config.hidden_size
-        self.action_in_proj = nn.Linear(config.max_action_dim, width)
-        self.state_proj = nn.Linear(config.max_state_dim, width)
-        
-        self.action_time_mlp_in = nn.Linear(width * 2, width)
-        self.action_time_mlp_out = nn.Linear(width, width)
 
     def forward(self, state, noisy_actions, time):
         """Embed state and noisy actions with time conditioning.
@@ -208,8 +205,8 @@ class PI0Attention(nn.Module):
     ):
         super().__init__()
         self.config = config
-        self.vlm_attention = vlm_attention
-        self.action_expert_attention = action_expert_attention
+        # Owned by the backbones; referenced here, not registered.
+        self._attentions = [vlm_attention, action_expert_attention]
         text_cfg = config.vlm_config.text_config
 
         self.rotary_emb = RotaryEmbedding(
@@ -222,6 +219,14 @@ class PI0Attention(nn.Module):
 
         self.num_heads = text_cfg.num_attention_heads
         self.head_dim = text_cfg.head_dim
+
+    @property
+    def vlm_attention(self):
+        return self._attentions[0]
+
+    @property
+    def action_expert_attention(self):
+        return self._attentions[1]
 
     def forward(self, hidden_states, attention_mask, position_ids, conds, use_cache: bool = False):
         """Forward pass with joint attention."""
@@ -277,8 +282,16 @@ class PI0MLP(nn.Module):
     def __init__(self, config: PI0Config, vlm_mlp: nn.Module, action_expert_mlp: nn.Module):
         super().__init__()
         self.config = config
-        self.vlm_mlp = vlm_mlp
-        self.action_expert_mlp = action_expert_mlp
+        # Owned by the backbones; referenced here, not registered.
+        self._mlps = [vlm_mlp, action_expert_mlp]
+
+    @property
+    def vlm_mlp(self):
+        return self._mlps[0]
+
+    @property
+    def action_expert_mlp(self):
+        return self._mlps[1]
 
     def forward(self, hidden_states):
         """Apply MLP to each backbone's hidden states."""
@@ -310,10 +323,12 @@ class PI0ModelLayer(nn.Module):
     ):
         super().__init__()
         self.config = config
-        self.input_layernorm = nn.ModuleList([vlm_layer.input_layernorm, action_expert_layer.input_layernorm])
-        self.post_attention_layernorm = nn.ModuleList(
-            [vlm_layer.post_attention_layernorm, action_expert_layer.post_attention_layernorm]
-        )
+        # Owned by the backbones; referenced here, not registered.
+        self.input_layernorm = [vlm_layer.input_layernorm, action_expert_layer.input_layernorm]
+        self.post_attention_layernorm = [
+            vlm_layer.post_attention_layernorm,
+            action_expert_layer.post_attention_layernorm,
+        ]
 
         self.self_attn = PI0Attention(
             config,
@@ -369,14 +384,11 @@ class PI0Model(nn.Module):
         super().__init__()
         self.config = config
 
-        self.vlm = PaliGemmaForConditionalGeneration(config.vlm_config)
-        self.action_expert = GemmaForCausalLM(config.action_expert_config)
-        # As in lerobot's PI0: the action expert never embeds tokens, and both
-        # lm_heads stay untied, unused parameters that the openpi checkpoint fills.
-        self.action_expert.model.embed_tokens = None
+        # lerobot's parameter tree; `self.vlm` / `self.action_expert` are views into it.
+        self.paligemma_with_expert = PaliGemmaWithExpert(config.vlm_config, config.action_expert_config)
 
         self.prefix_embedder = PI0PrefixEmbedder(config, self.vlm)
-        self.suffix_embedder = PI0SuffixEmbedder(config)
+        self.suffix_embedder = PI0SuffixEmbedder(config, self._build_suffix_projections(config))
 
         num_hidden_layers = config.vlm_config.text_config.num_hidden_layers
         self.layers = nn.ModuleList(
@@ -394,15 +406,33 @@ class PI0Model(nn.Module):
 
         self.to_bfloat16_for_selected_params(getattr(config, "dtype", "float32"))
 
-        # From here on the joint layers are the sole owners of the decoder
-        # weights; the backbone layer stacks become placeholders so that every
-        # parameter has exactly one state_dict name.
-        self.vlm.model.language_model.layers = nn.ModuleList([nn.Identity() for _ in self.layers])
-        self.action_expert.model.layers = nn.ModuleList([nn.Identity() for _ in self.layers])
-
         if config.compile_model:
             torch.set_float32_matmul_precision("high")
             self.sample_actions = torch.compile(self.sample_actions, mode=config.compile_mode)
+    def _build_suffix_projections(self, config) -> dict[str, nn.Linear]:
+        """openpi's suffix networks, owned here under lerobot's top-level names."""
+        width = config.action_expert_config.hidden_size
+        self.action_in_proj = nn.Linear(config.max_action_dim, width)
+        self.state_proj = nn.Linear(config.max_state_dim, width)
+        self.action_time_mlp_in = nn.Linear(width * 2, width)
+        self.action_time_mlp_out = nn.Linear(width, width)
+        return {
+            "action_in_proj": self.action_in_proj,
+            "state_proj": self.state_proj,
+            "action_time_mlp_in": self.action_time_mlp_in,
+            "action_time_mlp_out": self.action_time_mlp_out,
+        }
+
+    @property
+    def vlm(self):
+        """The PaliGemma VLM: a view, the parameters live under ``paligemma_with_expert``."""
+        return self.paligemma_with_expert.paligemma
+
+    @property
+    def action_expert(self):
+        """The Gemma action expert: a view, see ``vlm``."""
+        return self.paligemma_with_expert.gemma_expert
+
 
     def init_qkv_fusion_from_existing(self) -> None:
         """Fuse each attention's q/k/v projections into one QKVLinear."""
@@ -798,7 +828,7 @@ class PI0Policy(PreTrainedPolicy):
         ``load_state_dict``. qkv/mlp fusion runs here; the base does ``.to`` /
         ``.eval`` afterwards.
         """
-        load_pi0_checkpoint(model, model_file)
+        load_checkpoint(model, model_file, kind="pi0")
 
         if getattr(model.config, "fuse_qkv", True):
             model.model.init_qkv_fusion_from_existing()

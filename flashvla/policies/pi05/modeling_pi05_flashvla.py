@@ -23,14 +23,18 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 from lerobot.policies.pi_gemma import (
-    PiGemmaForCausalLM as GemmaForCausalLM,
     PaliGemmaForConditionalGenerationWithPiGemma as PaliGemmaForConditionalGeneration,
     _gated_residual,
 )
 from lerobot.configs.policies import PreTrainedConfig, T
 from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.utils.constants import ACTION, OBS_STATE, OBS_LANGUAGE_TOKENS, OBS_LANGUAGE_ATTENTION_MASK
-from flashvla.policies.loading import load_pi05_checkpoint
+from flashvla.policies.loading import load_checkpoint
+from flashvla.policies.paligemma_with_expert import (
+    PaliGemmaWithExpert,
+    ProjectionRefs,
+    decoder_linear_groups,
+)
 from flashvla.policies.pi05.configuration_pi05 import PI05FlashVLAConfig
 from flashvla.policies.pi05.utils import (
     ColdStartStats,
@@ -128,8 +132,8 @@ class PI05Attention(nn.Module):
     def __init__(self, config, vlm_attention, action_expert_attention):
         super().__init__()
         self.config = config
-        self.vlm_attention = vlm_attention
-        self.action_expert_attention = action_expert_attention
+        # Owned by the backbones; referenced here, not registered.
+        self._attentions = [vlm_attention, action_expert_attention]
         text_cfg = config.vlm_config.text_config
 
         self.rotary_emb = RotaryEmbedding(
@@ -141,6 +145,14 @@ class PI05Attention(nn.Module):
         self.attn = Attention(scale=vlm_attention.scaling)
         self.num_heads = text_cfg.num_attention_heads
         self.head_dim = text_cfg.head_dim
+
+    @property
+    def vlm_attention(self):
+        return self._attentions[0]
+
+    @property
+    def action_expert_attention(self):
+        return self._attentions[1]
 
     def forward(self, hidden_states, attention_mask, position_ids, use_cache: bool = False):
         attns = [self.vlm_attention, self.action_expert_attention]
@@ -193,8 +205,16 @@ class PI05MLP(nn.Module):
     def __init__(self, config, vlm_mlp, action_expert_mlp):
         super().__init__()
         self.config = config
-        self.vlm_mlp = vlm_mlp
-        self.action_expert_mlp = action_expert_mlp
+        # Owned by the backbones; referenced here, not registered.
+        self._mlps = [vlm_mlp, action_expert_mlp]
+
+    @property
+    def vlm_mlp(self):
+        return self._mlps[0]
+
+    @property
+    def action_expert_mlp(self):
+        return self._mlps[1]
 
     def forward(self, hidden_states):
         mlps = [self.vlm_mlp, self.action_expert_mlp]
@@ -215,7 +235,7 @@ class PI05MLP(nn.Module):
 
 
 
-class PI05SuffixEmbedder(nn.Module):
+class PI05SuffixEmbedder(ProjectionRefs):
     """Embed noisy actions with per-token time conditioning for FlashVLA.
 
     Key difference from baseline: takes per-token time [B, N*C] instead of
@@ -223,23 +243,11 @@ class PI05SuffixEmbedder(nn.Module):
     Padded slots are zeroed out in embeddings.
     """
 
-    def __init__(self, config: PI05FlashVLAConfig):
-        super().__init__()
+    def __init__(self, config: PI05FlashVLAConfig, projections):
+        super().__init__(projections)
         self.config = config
         self.N = config.num_buffer_slots
         self.C = config.chunk_size
-
-        self.action_in_proj = nn.Linear(config.max_action_dim, config.action_expert_config.hidden_size)
-
-        self.time_mlp_in = nn.Linear(config.action_expert_config.hidden_size, config.action_expert_config.hidden_size)
-        self.time_mlp_out = nn.Linear(config.action_expert_config.hidden_size, config.action_expert_config.hidden_size)
-
-        if config.state_cond:
-            self.state_proj = nn.Linear(config.max_state_dim, config.action_expert_config.hidden_size)
-            self.state_mlp_in = nn.Linear(config.action_expert_config.hidden_size, config.action_expert_config.hidden_size)
-            self.state_mlp_out = nn.Linear(config.action_expert_config.hidden_size, config.action_expert_config.hidden_size)
-            nn.init.zeros_(self.state_mlp_out.weight)
-            nn.init.zeros_(self.state_mlp_out.bias)
 
     def forward(self, state, noisy_actions, time, padding_mask=None):
         """Embed noisy actions with time and state conditioning.
@@ -315,10 +323,12 @@ class PI05ModelLayer(nn.Module):
     def __init__(self, config, vlm_layer, action_expert_layer):
         super().__init__()
         self.config = config
-        self.input_layernorm = nn.ModuleList([vlm_layer.input_layernorm, action_expert_layer.input_layernorm])
-        self.post_attention_layernorm = nn.ModuleList(
-            [vlm_layer.post_attention_layernorm, action_expert_layer.post_attention_layernorm]
-        )
+        # Owned by the backbones; referenced here, not registered.
+        self.input_layernorm = [vlm_layer.input_layernorm, action_expert_layer.input_layernorm]
+        self.post_attention_layernorm = [
+            vlm_layer.post_attention_layernorm,
+            action_expert_layer.post_attention_layernorm,
+        ]
         self.self_attn = PI05Attention(config, vlm_layer.self_attn, action_expert_layer.self_attn)
         self.mlp = PI05MLP(config, vlm_layer.mlp, action_expert_layer.mlp)
 
@@ -463,14 +473,11 @@ class PI05FlashVLAModel(nn.Module):
         self.N = config.num_buffer_slots
         self.C = config.chunk_size
 
-        self.vlm = PaliGemmaForConditionalGeneration(config.vlm_config)
-        self.action_expert = GemmaForCausalLM(config.action_expert_config)
-        # As in lerobot's PI0.5: the action expert never embeds tokens, and both
-        # lm_heads stay untied, unused parameters that the openpi checkpoint fills.
-        self.action_expert.model.embed_tokens = None
+        # lerobot's parameter tree; `self.vlm` / `self.action_expert` are views into it.
+        self.paligemma_with_expert = PaliGemmaWithExpert(config.vlm_config, config.action_expert_config)
 
         self.prefix_embedder = PI05PrefixEmbedder(config, self.vlm)
-        self.suffix_embedder = PI05SuffixEmbedder(config)
+        self.suffix_embedder = PI05SuffixEmbedder(config, self._build_suffix_projections(config))
 
         num_hidden_layers = config.vlm_config.text_config.num_hidden_layers
         self.layers = nn.ModuleList([
@@ -485,12 +492,6 @@ class PI05FlashVLAModel(nn.Module):
         self.action_out_proj = nn.Linear(config.action_expert_config.hidden_size, config.max_action_dim)
 
         self.to_bfloat16_for_selected_params(getattr(config, "dtype", "float32"))
-
-        # From here on the joint layers are the sole owners of the decoder
-        # weights; the backbone layer stacks become placeholders so that every
-        # parameter has exactly one state_dict name.
-        self.vlm.model.language_model.layers = nn.ModuleList([nn.Identity() for _ in self.layers])
-        self.action_expert.model.layers = nn.ModuleList([nn.Identity() for _ in self.layers])
 
         self.register_buffer(
             "_cold_step_t",
@@ -538,6 +539,38 @@ class PI05FlashVLAModel(nn.Module):
                 m.to(dtype=torch.float32)
         else:
             raise ValueError(f"Invalid precision: {precision}")
+    def _build_suffix_projections(self, config) -> dict[str, nn.Linear]:
+        """openpi's suffix networks, owned here under lerobot's top-level names."""
+        width = config.action_expert_config.hidden_size
+        self.action_in_proj = nn.Linear(config.max_action_dim, width)
+        self.time_mlp_in = nn.Linear(width, width)
+        self.time_mlp_out = nn.Linear(width, width)
+        projections = {
+            "action_in_proj": self.action_in_proj,
+            "time_mlp_in": self.time_mlp_in,
+            "time_mlp_out": self.time_mlp_out,
+        }
+        if config.state_cond:
+            self.state_proj = nn.Linear(config.max_state_dim, width)
+            self.state_mlp_in = nn.Linear(width, width)
+            self.state_mlp_out = nn.Linear(width, width)
+            nn.init.zeros_(self.state_mlp_out.weight)
+            nn.init.zeros_(self.state_mlp_out.bias)
+            projections.update(
+                state_proj=self.state_proj, state_mlp_in=self.state_mlp_in, state_mlp_out=self.state_mlp_out
+            )
+        return projections
+
+    @property
+    def vlm(self):
+        """The PaliGemma VLM: a view, the parameters live under ``paligemma_with_expert``."""
+        return self.paligemma_with_expert.paligemma
+
+    @property
+    def action_expert(self):
+        """The Gemma action expert: a view, see ``vlm``."""
+        return self.paligemma_with_expert.gemma_expert
+
 
     def init_qkv_fusion_from_existing(self) -> None:
         """Fuse each attention's q/k/v projections into one QKVLinear."""
@@ -1093,29 +1126,40 @@ class PI05FlashVLAPolicy(PreTrainedPolicy):
     config_class = PI05FlashVLAConfig
     name = "pi05-flashvla"
     fsdp_wrap_class_names = (
-        "FlashVLAPI05ModelLayer",
         "SiglipEncoderLayer",
         "PaliGemmaMultiModalProjector",
         "Embedding",
-        "PI05SuffixEmbedder",
     )
-    fsdp_wrap_name_suffixes = ("vlm.lm_head", "action_expert.lm_head")
+    fsdp_wrap_name_suffixes = ("paligemma.lm_head", "gemma_expert.lm_head")
     fsdp_fp32_class_names = (
         "FlashVLARMSNorm",
         "PiGemmaRMSNorm",
-        "PI05SuffixEmbedder",
         "SiglipVisionEmbeddings",
     )
-    fsdp_fp32_name_suffixes = (
-        "vision_model.post_layernorm",
-        "model.language_model.norm",
-        "action_expert.model.norm",
-        "action_out_proj",
+    # The suffix projections are fp32 islands whose outputs stay fp32: PI0.5's
+    # adaRMS conditioning intentionally remains fp32 up to each fp32 RMSNorm
+    # island, and the model explicitly casts only the suffix token embeddings
+    # to the backbone dtype.
+    _suffix_projections = (
+        "action_in_proj", "time_mlp_in", "time_mlp_out", "state_proj", "state_mlp_in", "state_mlp_out"
     )
-    # PI0.5's adaRMS conditioning intentionally remains fp32 between the
-    # suffix embedder and each fp32 RMSNorm island. The model explicitly casts
-    # only suffix token embeddings to the backbone dtype.
-    fsdp_fp32_output_name_suffixes = ("suffix_embedder", "action_out_proj")
+
+    @property
+    def fsdp_fp32_name_suffixes(self) -> tuple[str, ...]:
+        present = tuple(f"model.{name}" for name in self._suffix_projections if hasattr(self.model, name))
+        return ("vision_model.post_layernorm", "language_model.norm", "gemma_expert.model.norm", *present, "model.action_out_proj")
+
+    @property
+    def fsdp_fp32_output_name_suffixes(self) -> tuple[str, ...]:
+        present = tuple(f"model.{name}" for name in self._suffix_projections if hasattr(self.model, name))
+        return (*present, "model.action_out_proj")
+
+    def fsdp_compute_groups(self):
+        """The decoder projections of both backbones, one FSDP2 group per depth."""
+        return [
+            (f"model.layers.{index}", modules)
+            for index, modules in enumerate(decoder_linear_groups(self.model.layers))
+        ]
 
     def __init__(
         self,
@@ -1160,7 +1204,7 @@ class PI05FlashVLAPolicy(PreTrainedPolicy):
         fusion, cold-start stats) runs here; the base does ``.to(device)`` /
         ``.eval()`` afterwards.
         """
-        load_pi05_checkpoint(model, model_file)
+        load_checkpoint(model, model_file, kind="pi05")
 
         from flashvla.policies.pi05.patches import FlashVLARMSNorm as PatchedGemmaRMSNorm
         from lerobot.policies.pi_gemma import PiGemmaRMSNorm as OriginalGemmaRMSNorm

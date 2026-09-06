@@ -13,16 +13,17 @@ from pathlib import Path
 import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
-from lerobot.policies.pi_gemma import (
-    PiGemmaForCausalLM as GemmaForCausalLM,
-    PaliGemmaForConditionalGenerationWithPiGemma as PaliGemmaForConditionalGeneration,
-)
 
 from lerobot.configs.policies import PreTrainedConfig, T
 from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.utils.constants import ACTION, OBS_STATE, OBS_LANGUAGE_TOKENS, OBS_LANGUAGE_ATTENTION_MASK
 
-from flashvla.policies.loading import load_pi0_checkpoint
+from flashvla.policies.loading import load_checkpoint
+from flashvla.policies.paligemma_with_expert import (
+    PaliGemmaWithExpert,
+    ProjectionRefs,
+    decoder_linear_groups,
+)
 from flashvla.policies.pi0.configuration_pi0 import PI0FlashVLAConfig
 from flashvla.policies.pi0.modeling_pi0 import (
     PI0PrefixEmbedder,
@@ -63,7 +64,7 @@ logger = logging.getLogger(__name__)
 
 
 
-class PI0SuffixEmbedder(nn.Module):
+class PI0SuffixEmbedder(ProjectionRefs):
     """Embed state + noisy actions with per-slot time conditioning.
 
     Two operating modes selected by ``config.use_adarms_time_cond``:
@@ -91,24 +92,9 @@ class PI0SuffixEmbedder(nn.Module):
         training pushes the weights off zero.
     """
 
-    def __init__(self, config: PI0FlashVLAConfig):
-        super().__init__()
+    def __init__(self, config: PI0FlashVLAConfig, projections):
+        super().__init__(projections)
         self.config = config
-
-        width = config.action_expert_config.hidden_size
-        self.action_in_proj = nn.Linear(config.max_action_dim, width)
-        self.state_proj = nn.Linear(config.max_state_dim, width)
-        self.action_time_mlp_in = nn.Linear(width * 2, width)
-        self.action_time_mlp_out = nn.Linear(width, width)
-
-        if config.use_adarms_time_cond:
-            self.time_mlp_in = nn.Linear(width, width)
-            self.time_mlp_out = nn.Linear(width, width)
-            self.state_mlp_in = nn.Linear(width, width)
-            self.state_mlp_out = nn.Linear(width, width)
-            nn.init.zeros_(self.state_mlp_out.weight)
-            nn.init.zeros_(self.state_mlp_out.bias)
-
         self.C = config.chunk_size
 
     def forward(
@@ -244,14 +230,11 @@ class PI0FlashVLAModel(nn.Module):
         if config.use_adarms_time_cond:
             config.action_expert_config.use_adarms = True
             config.action_expert_config.adarms_cond_dim = config.action_expert_config.hidden_size
-        self.vlm = PaliGemmaForConditionalGeneration(config.vlm_config)
-        self.action_expert = GemmaForCausalLM(config.action_expert_config)
-        # As in lerobot's PI0: the action expert never embeds tokens, and both
-        # lm_heads stay untied, unused parameters that the openpi checkpoint fills.
-        self.action_expert.model.embed_tokens = None
+        # lerobot's parameter tree; `self.vlm` / `self.action_expert` are views into it.
+        self.paligemma_with_expert = PaliGemmaWithExpert(config.vlm_config, config.action_expert_config)
 
         self.prefix_embedder = PI0PrefixEmbedder(config, self.vlm)
-        self.suffix_embedder = PI0SuffixEmbedder(config)
+        self.suffix_embedder = PI0SuffixEmbedder(config, self._build_suffix_projections(config))
 
         num_hidden_layers = config.vlm_config.text_config.num_hidden_layers
         self.layers = nn.ModuleList([
@@ -266,12 +249,6 @@ class PI0FlashVLAModel(nn.Module):
         self.action_out_proj = nn.Linear(config.action_expert_config.hidden_size, config.max_action_dim)
 
         self.to_bfloat16_for_selected_params(getattr(config, "dtype", "float32"))
-
-        # From here on the joint layers are the sole owners of the decoder
-        # weights; the backbone layer stacks become placeholders so that every
-        # parameter has exactly one state_dict name.
-        self.vlm.model.language_model.layers = nn.ModuleList([nn.Identity() for _ in self.layers])
-        self.action_expert.model.layers = nn.ModuleList([nn.Identity() for _ in self.layers])
 
         self.register_buffer("_cold_step_t", torch.zeros((), dtype=torch.int64), persistent=False)
 
@@ -317,6 +294,45 @@ class PI0FlashVLAModel(nn.Module):
                 m.to(dtype=torch.float32)
         else:
             raise ValueError(f"Invalid precision: {precision}")
+    def _build_suffix_projections(self, config) -> dict[str, nn.Linear]:
+        """openpi's suffix networks under lerobot's top-level names, plus the
+        adaRMS conditioning MLPs when ``use_adarms_time_cond`` is on."""
+        width = config.action_expert_config.hidden_size
+        self.action_in_proj = nn.Linear(config.max_action_dim, width)
+        self.state_proj = nn.Linear(config.max_state_dim, width)
+        self.action_time_mlp_in = nn.Linear(width * 2, width)
+        self.action_time_mlp_out = nn.Linear(width, width)
+        projections = {
+            "action_in_proj": self.action_in_proj,
+            "state_proj": self.state_proj,
+            "action_time_mlp_in": self.action_time_mlp_in,
+            "action_time_mlp_out": self.action_time_mlp_out,
+        }
+        if config.use_adarms_time_cond:
+            self.time_mlp_in = nn.Linear(width, width)
+            self.time_mlp_out = nn.Linear(width, width)
+            self.state_mlp_in = nn.Linear(width, width)
+            self.state_mlp_out = nn.Linear(width, width)
+            nn.init.zeros_(self.state_mlp_out.weight)
+            nn.init.zeros_(self.state_mlp_out.bias)
+            projections.update(
+                time_mlp_in=self.time_mlp_in,
+                time_mlp_out=self.time_mlp_out,
+                state_mlp_in=self.state_mlp_in,
+                state_mlp_out=self.state_mlp_out,
+            )
+        return projections
+
+    @property
+    def vlm(self):
+        """The PaliGemma VLM: a view, the parameters live under ``paligemma_with_expert``."""
+        return self.paligemma_with_expert.paligemma
+
+    @property
+    def action_expert(self):
+        """The Gemma action expert: a view, see ``vlm``."""
+        return self.paligemma_with_expert.gemma_expert
+
 
     def init_qkv_fusion_from_existing(self) -> None:
         """Fuse each attention's q/k/v projections into one QKVLinear."""
@@ -740,16 +756,11 @@ class PI0FlashVLAModel(nn.Module):
 
 
 # A plain pi0 checkpoint carries the expert's RMSNorm scales, which the adaRMS
-# expert replaces with FiLM projections; those projections and the suffix
-# embedder's conditioning MLPs are the parameters such a file cannot provide.
-_ADARMS_INCOMPATIBLE_KEYS = (
-    r"^model\.layers\.\d+\.(input_layernorm|post_attention_layernorm)\.1\.weight$",
-    r"^model\.action_expert\.model\.norm\.weight$",
-)
+# expert replaces with FiLM projections; those projections and the conditioning
+# MLPs are the parameters such a file cannot provide (the loader skips the scales).
 _ADARMS_FRESH_KEYS = (
-    r"^model\.layers\.\d+\.(input_layernorm|post_attention_layernorm)\.1\.dense\.",
-    r"^model\.action_expert\.model\.norm\.dense\.",
-    r"^model\.suffix_embedder\.(time_mlp_in|time_mlp_out|state_mlp_in|state_mlp_out)\.",
+    r"^model\.paligemma_with_expert\.gemma_expert\.model\.(layers\.\d+\.(input_layernorm|post_attention_layernorm)|norm)\.dense\.",
+    r"^model\.(time_mlp_in|time_mlp_out|state_mlp_in|state_mlp_out)\.",
 )
 
 
@@ -759,26 +770,35 @@ class PI0FlashVLAPolicy(PreTrainedPolicy):
     config_class = PI0FlashVLAConfig
     name = "pi0-flashvla"
     fsdp_wrap_class_names = (
-        "FlashVLAPI0ModelLayer",
         "SiglipEncoderLayer",
         "PaliGemmaMultiModalProjector",
         "Embedding",
-        "PI0SuffixEmbedder",
     )
-    fsdp_wrap_name_suffixes = ("vlm.lm_head", "action_expert.lm_head")
+    fsdp_wrap_name_suffixes = ("paligemma.lm_head", "gemma_expert.lm_head")
     fsdp_fp32_class_names = (
         "FlashVLARMSNorm",
         "PiGemmaRMSNorm",
-        "PI0SuffixEmbedder",
         "SiglipVisionEmbeddings",
     )
-    fsdp_fp32_name_suffixes = (
-        "vision_model.post_layernorm",
-        "model.language_model.norm",
-        "action_expert.model.norm",
-        "action_out_proj",
+    # The suffix projections are fp32 islands (as the suffix embedder was); only
+    # the action head keeps an fp32 output.
+    _suffix_projections = (
+        "action_in_proj", "state_proj", "action_time_mlp_in", "action_time_mlp_out",
+        "time_mlp_in", "time_mlp_out", "state_mlp_in", "state_mlp_out",
     )
-    fsdp_fp32_output_name_suffixes = ("action_out_proj",)
+    fsdp_fp32_output_name_suffixes = ("model.action_out_proj",)
+
+    @property
+    def fsdp_fp32_name_suffixes(self) -> tuple[str, ...]:
+        present = tuple(f"model.{name}" for name in self._suffix_projections if hasattr(self.model, name))
+        return ("vision_model.post_layernorm", "language_model.norm", "gemma_expert.model.norm", *present, "model.action_out_proj")
+
+    def fsdp_compute_groups(self):
+        """The decoder projections of both backbones, one FSDP2 group per depth."""
+        return [
+            (f"model.layers.{index}", modules)
+            for index, modules in enumerate(decoder_linear_groups(self.model.layers))
+        ]
 
     def __init__(
         self,
@@ -825,10 +845,11 @@ class PI0FlashVLAPolicy(PreTrainedPolicy):
         the base does ``.to(device)`` / ``.eval()`` afterwards.
         """
         adarms = bool(getattr(model.config, "use_adarms_time_cond", False))
-        fresh = load_pi0_checkpoint(
+        fresh = load_checkpoint(
             model,
             model_file,
-            drop=_ADARMS_INCOMPATIBLE_KEYS if adarms else (),
+            kind="pi0",
+            adarms_expert=adarms,
             fresh=_ADARMS_FRESH_KEYS if adarms else (),
         )
 

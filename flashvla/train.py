@@ -165,7 +165,7 @@ def _iter_action_expert_norm_init_modules(
     if include_final_norm:
         action_expert_model = getattr(getattr(model, "action_expert", None), "model", None)
         yield from _iter_adaptive_norm_linears(
-            "model.action_expert.model.norm",
+            "model.paligemma_with_expert.gemma_expert.model.norm",
             getattr(action_expert_model, "norm", None),
         )
 
@@ -196,14 +196,6 @@ def _iter_action_expert_norm_init_modules(
 def _iter_streaming_time_mlp_modules(policy: PreTrainedPolicy):
     """Yield time-conditioning projections owned by a streaming policy."""
     model = policy.model
-
-    suffix_embedder = getattr(model, "suffix_embedder", None)
-    if suffix_embedder is not None:
-        for attribute in ("time_mlp_in", "time_mlp_out"):
-            module = getattr(suffix_embedder, attribute, None)
-            if isinstance(module, torch.nn.Linear):
-                yield f"model.suffix_embedder.{attribute}", module
-
     for attribute in (
         "action_time_mlp_in",
         "action_time_mlp_out",
