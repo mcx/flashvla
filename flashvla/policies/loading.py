@@ -15,7 +15,7 @@
 
 from __future__ import annotations
 
-import logging
+import re
 from collections.abc import Collection, Iterable
 
 from torch import Tensor, nn
@@ -27,6 +27,15 @@ def _module_name_by_id(root: nn.Module) -> dict[int, str]:
     for name, module in root.named_modules():
         names.setdefault(id(module), name)
     return names
+
+
+def _parameter_aliases(model: nn.Module) -> dict[int, list[str]]:
+    """Map ``id(parameter)`` to every state_dict name it is registered under, in
+    registration order."""
+    aliases: dict[int, list[str]] = {}
+    for name, parameter in model.named_parameters(remove_duplicate=False):
+        aliases.setdefault(id(parameter), []).append(name)
+    return aliases
 
 
 def restore_untied_lm_head_embeddings(
@@ -41,9 +50,10 @@ def restore_untied_lm_head_embeddings(
     tensor object, copies the head weight into the embedding entry when the
     checkpoint supplied the head but not the embedding.
 
-    The ``embedding_key not in mapped_sd`` guard makes this a no-op for
-    checkpoints that already carry the embedding explicitly -- in particular
-    FlashVLA's own exports, so resume is unaffected.
+    The guard checks every name the embedding is registered under (e.g. the
+    prefix embedder's ``lang_embedder`` view, which safetensors' storage dedup
+    may have kept instead of ``embed_tokens``), so a checkpoint that already
+    carries the embedding under any alias is left alone.
 
     Args:
         instance: The freshly constructed policy, before ``load_state_dict``.
@@ -54,6 +64,7 @@ def restore_untied_lm_head_embeddings(
         The embedding keys that were filled in, for logging.
     """
     module_names = _module_name_by_id(instance)
+    aliases = _parameter_aliases(instance)
     restored: list[str] = []
 
     for name, module in instance.named_modules():
@@ -85,7 +96,10 @@ def restore_untied_lm_head_embeddings(
         head_key = f"{head_name}.weight"
         embedding_key = f"{embedding_name}.weight"
 
-        if head_key not in mapped_sd or embedding_key in mapped_sd:
+        embedding_present = any(
+            alias in mapped_sd for alias in aliases.get(id(embedding_weight), [embedding_key])
+        )
+        if head_key not in mapped_sd or embedding_present:
             continue
         if embedding_key not in target_sd:
             continue
@@ -179,112 +193,83 @@ def assert_checkpoint_covers_parameters(
     )
 
 
-# Prefix rewrites turning a raw lerobot/openpi pi0.5 checkpoint (paligemma_with_expert.*
-# namespace, bare openpi suffix-net keys) into this repo's model.* namespace. Shared by
-# the eager (PI05Policy) and streaming (PI05FlashVLAPolicy) loaders.
-PI05_RENAME_RULES: list[tuple[str, str]] = [
-    ("model.action_in_proj.", "model.suffix_embedder.action_in_proj."),
-    ("model.action_out_proj.", "model.action_out_proj."),
-    ("model.time_mlp_in.", "model.suffix_embedder.time_mlp_in."),
-    ("model.time_mlp_out.", "model.suffix_embedder.time_mlp_out."),
-    ("model.state_proj.", "model.suffix_embedder.state_proj."),
-    ("model.state_mlp_in.", "model.suffix_embedder.state_mlp_in."),
-    ("model.state_mlp_out.", "model.suffix_embedder.state_mlp_out."),
-    ("model.paligemma_with_expert.gemma_expert.", "model.action_expert."),
-    ("model.paligemma_with_expert.paligemma.", "model.vlm."),
-    ("action_in_proj.", "model.suffix_embedder.action_in_proj."),
-    ("action_out_proj.", "model.action_out_proj."),
-    ("time_mlp_in.", "model.suffix_embedder.time_mlp_in."),
-    ("time_mlp_out.", "model.suffix_embedder.time_mlp_out."),
-    ("state_proj.", "model.suffix_embedder.state_proj."),
-    ("state_mlp_in.", "model.suffix_embedder.state_mlp_in."),
-    ("state_mlp_out.", "model.suffix_embedder.state_mlp_out."),
-    ("paligemma_with_expert.gemma_expert.", "model.action_expert."),
-    ("paligemma_with_expert.paligemma.", "model.vlm."),
-]
+# PI0.5 ------------------------------------------------------------------------
+#
+# Both PI0.5 policies register every parameter under exactly one state_dict
+# name, so loading is lerobot's recipe: rename the openpi keys, then one strict
+# ``load_state_dict``. The joint layer at depth N owns the VLM and action-expert
+# sublayers of that depth side by side, which is where the two backbone layer
+# stacks land. lerobot's ``save_pretrained`` nests the openpi names under
+# ``model.``; the optional prefix covers both spellings. Keys this package wrote
+# already carry the final names and fall through every rule unchanged.
+_VLM_LAYER = r"^(?:model\.)?paligemma_with_expert\.paligemma\.model\.language_model\.layers\.(\d+)\."
+_EXPERT_LAYER = r"^(?:model\.)?paligemma_with_expert\.gemma_expert\.model\.layers\.(\d+)\."
+PI05_KEY_RULES: tuple[tuple[str, str], ...] = (
+    (_VLM_LAYER + r"self_attn\.", r"model.layers.\1.self_attn.vlm_attention."),
+    (_VLM_LAYER + r"mlp\.", r"model.layers.\1.mlp.vlm_mlp."),
+    (_VLM_LAYER + r"(input_layernorm|post_attention_layernorm)\.", r"model.layers.\1.\2.0."),
+    (_EXPERT_LAYER + r"self_attn\.", r"model.layers.\1.self_attn.action_expert_attention."),
+    (_EXPERT_LAYER + r"mlp\.", r"model.layers.\1.mlp.action_expert_mlp."),
+    (_EXPERT_LAYER + r"(input_layernorm|post_attention_layernorm)\.", r"model.layers.\1.\2.1."),
+    (r"^(?:model\.)?paligemma_with_expert\.paligemma\.", "model.vlm."),
+    (r"^(?:model\.)?paligemma_with_expert\.gemma_expert\.", "model.action_expert."),
+    (r"^(?:model\.)?(action_in_proj|time_mlp_in|time_mlp_out)\.", r"model.suffix_embedder.\1."),
+    (r"^(?:model\.)?action_out_proj\.", "model.action_out_proj."),
+)
+PI05_VLM_EMBED_KEY = "model.vlm.model.language_model.embed_tokens.weight"
+PI05_VLM_HEAD_KEY = "model.vlm.lm_head.weight"
 
 
-def load_remapped_checkpoint(
-    model: nn.Module,
-    model_file: str,
-    rename_rules: Iterable[tuple[str, str]] = (),
-    *,
-    allow_fresh: Iterable[str] = (),
-    expected_unexpected: Iterable[str] = (),
-    native_load_model: bool = False,
-    raw_marker: str = "paligemma_with_expert.",
-    device: str = "cpu",
-    source: str | None = None,
-) -> None:
-    """Fill ``model`` from a single-file safetensors checkpoint.
+def remap_pi05_state_dict(state_dict: dict[str, Tensor]) -> dict[str, Tensor]:
+    """Rename an openpi/lerobot PI0.5 checkpoint into this package's key space."""
+    remapped: dict[str, Tensor] = {}
+    for key, value in state_dict.items():
+        for pattern, replacement in PI05_KEY_RULES:
+            key, count = re.subn(pattern, replacement, key, count=1)
+            if count:
+                break
+        remapped[key] = value
+    # openpi ties the VLM input embedding to its lm_head and stores the head only.
+    if PI05_VLM_EMBED_KEY not in remapped and PI05_VLM_HEAD_KEY in remapped:
+        remapped[PI05_VLM_EMBED_KEY] = remapped[PI05_VLM_HEAD_KEY]
+    return remapped
 
-    Two layouts are handled, selected by a header sniff for ``raw_marker``:
 
-    * NATIVE — keys already in this policy's ``model.*`` namespace. When
-      ``native_load_model`` is set, delegate to ``safetensors.torch.load_model``,
-      whose storage-based ``_remove_duplicate_names(preferred_names=file_keys)``
-      reconcile IS an identity coverage check: a weight saved under EITHER of its
-      alias names is accepted, and any genuinely missing/unexpected tensor raises.
-      It requires the model's alias tree and tied embeddings to be LIVE, so callers
-      must invoke this BEFORE any weight fusion / alias detach.
-    * RAW — a foreign openpi base whose keys need prefix-remapping. Apply
-      ``rename_rules`` (first match wins, identity fall-through), drop
-      shape-mismatched targets, restore tied embeddings the file dropped, load
-      non-strict, treat unexpected keys (minus ``expected_unexpected``) as fatal,
-      then assert full coverage (``allow_fresh`` names may stay at init).
+def load_pi05_checkpoint(model: nn.Module, model_file: str) -> None:
+    """Fill a PI0.5 policy from ``model.safetensors``: rename, then one strict load.
 
-    The check is always strict regardless of any caller ``strict`` flag: a native
-    load_model raises on gaps, and the raw branch asserts full coverage.
+    The file is read on the CPU (every rank of a distributed job shares one
+    default GPU at this point); the caller moves the policy afterwards.
     """
-    from safetensors import safe_open
-    from safetensors.torch import load_file, load_model
+    from safetensors.torch import load_file
 
-    with safe_open(model_file, framework="pt") as f:
-        is_raw = any(k.startswith(raw_marker) for k in f.keys())
+    state_dict = remap_pi05_state_dict(load_file(model_file))
+    try:
+        model.load_state_dict(state_dict, strict=True)
+    except RuntimeError as error:
+        if any(key.startswith(_PRE_ALIAS_FREE_MARKERS) for key in state_dict):
+            raise RuntimeError(
+                f"{model_file} was saved before the alias-free PI0.5 layout; convert it once with "
+                "`python -m flashvla.policies.pi05.convert_legacy_checkpoint <src_dir> <dst_dir>`"
+            ) from error
+        raise
 
-    if native_load_model and not is_raw:
-        load_model(model, model_file, strict=True, device=device)
-        return
 
-    rules = list(rename_rules)
-
-    def map_key(key: str) -> str:
-        for src, dst in rules:
-            if key.startswith(src):
-                return dst + key[len(src):]
-        return key
-
-    original_sd = load_file(model_file, device=device)
-    target_sd = model.state_dict()
-    mapped_sd: dict[str, Tensor] = {}
-    for old_key, value in original_sd.items():
-        new_key = map_key(old_key)
-        if new_key in target_sd and target_sd[new_key].shape != value.shape:
-            continue
-        mapped_sd[new_key] = value
-
-    restored = restore_untied_lm_head_embeddings(model, mapped_sd, target_sd)
-    if restored:
-        logging.info(
-            "Restored %d tied input embedding(s) from their lm_head: %s",
-            len(restored),
-            ", ".join(restored),
-        )
-
-    incompatible = model.load_state_dict(mapped_sd, strict=False)
-    tolerated = set(expected_unexpected)
-    fatal = [k for k in incompatible.unexpected_keys if k not in tolerated]
-    if fatal:
-        raise RuntimeError("Checkpoint loading failed.\n" f"Unexpected keys: {fatal}")
-
-    assert_checkpoint_covers_parameters(
-        model, mapped_sd, source=source or str(model_file), allow=allow_fresh
-    )
+# Names only a checkpoint from before the alias-free layout can contain.
+_PRE_ALIAS_FREE_MARKERS = (
+    "model.prefix_embedder.lang_embedder.",
+    "model.action_expert.model.embed_tokens.",
+    "model.action_expert.model.layers.",
+    "model.vlm.model.language_model.layers.",
+)
 
 
 __all__ = [
-    "PI05_RENAME_RULES",
-    "load_remapped_checkpoint",
+    "PI05_KEY_RULES",
+    "PI05_VLM_EMBED_KEY",
+    "PI05_VLM_HEAD_KEY",
+    "remap_pi05_state_dict",
+    "load_pi05_checkpoint",
     "assert_checkpoint_covers_parameters",
     "find_unfilled_parameters",
     "restore_untied_lm_head_embeddings",

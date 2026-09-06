@@ -134,21 +134,11 @@ def build_fsdp_module_plan(policy: nn.Module, mixed_precision: str) -> FSDPModul
         if module_class_name[id(item.module)] in wrap_class_names
         and not any(_is_at_or_below(item.name, root_name) for root_name in fp32_roots)
     ]
-    class_compute_parameter_ids = [
-        {id(parameter) for parameter in item.module.parameters()}
-        for item in class_compute_modules
-    ]
     name_compute_modules = []
     for item in named_modules:
         if not item.name.endswith(wrap_name_suffixes):
             continue
         if any(_is_at_or_below(item.name, root_name) for root_name in fp32_roots):
-            continue
-        parameter_ids = {id(parameter) for parameter in item.module.parameters()}
-        # A tied lm_head may share its weight with an Embedding communication
-        # group despite being a distinct module object. In that case the used
-        # embedding owns the parameter and the dormant head must not re-wrap it.
-        if any(parameter_ids & owner_ids for owner_ids in class_compute_parameter_ids):
             continue
         name_compute_modules.append(item)
 

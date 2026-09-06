@@ -30,10 +30,7 @@ from lerobot.policies.pi_gemma import (
 from lerobot.configs.policies import PreTrainedConfig, T
 from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.utils.constants import ACTION, OBS_STATE, OBS_LANGUAGE_TOKENS, OBS_LANGUAGE_ATTENTION_MASK
-from flashvla.policies.loading import (
-    PI05_RENAME_RULES,
-    load_remapped_checkpoint,
-)
+from flashvla.policies.loading import load_pi05_checkpoint
 from flashvla.policies.pi05.configuration_pi05 import PI05Config
 from flashvla.policies.pi05.utils import (
     create_sinusoidal_pos_embedding,
@@ -84,8 +81,9 @@ class PI05PrefixEmbedder(nn.Module):
     def __init__(self, config: PI05Config, vlm: PaliGemmaForConditionalGeneration):
         super().__init__()
         self.config = config
+        # A plain reference rather than a registered submodule, so the VLM's
+        # embedding keeps exactly one state_dict name.
         self._paligemma_model = [vlm.model]
-        self.lang_embedder = vlm.language_model.embed_tokens
 
     def forward(self, images, img_masks, tokens, masks):
         """Embed images and language into prefix sequence.
@@ -124,7 +122,7 @@ class PI05PrefixEmbedder(nn.Module):
             pad_masks.append(img_mask[:, None].expand(bsz, num_img_embs))
             att_masks += [0] * num_img_embs
 
-        lang_emb = self.lang_embedder(tokens)
+        lang_emb = self._paligemma_model[0].language_model.embed_tokens(tokens)
         lang_emb_dim = lang_emb.shape[-1]
         lang_emb = lang_emb * math.sqrt(lang_emb_dim)
 
@@ -549,6 +547,9 @@ class PI05Model(nn.Module):
 
         self.vlm = PaliGemmaForConditionalGeneration(config.vlm_config)
         self.action_expert = GemmaForCausalLM(config.action_expert_config)
+        # As in lerobot's PI0.5: the action expert never embeds tokens, and both
+        # lm_heads stay untied, unused parameters that the openpi checkpoint fills.
+        self.action_expert.model.embed_tokens = None
 
         self.prefix_embedder = PI05PrefixEmbedder(config, self.vlm)
         self.suffix_embedder = PI05SuffixEmbedder(config)
@@ -569,19 +570,15 @@ class PI05Model(nn.Module):
 
         self.to_bfloat16_for_selected_params(getattr(config, "dtype", "float32"))
 
+        # From here on the joint layers are the sole owners of the decoder
+        # weights; the backbone layer stacks become placeholders so that every
+        # parameter has exactly one state_dict name.
+        self.vlm.model.language_model.layers = nn.ModuleList([nn.Identity() for _ in self.layers])
+        self.action_expert.model.layers = nn.ModuleList([nn.Identity() for _ in self.layers])
+
         if config.compile_model:
             torch.set_float32_matmul_precision("high")
             self.sample_actions = torch.compile(self.sample_actions, mode=config.compile_mode)
-
-    def detach_backbone_layer_aliases(self) -> None:
-        """Keep one registered owner for every decoder parameter."""
-        num_layers = len(self.layers)
-        self.vlm.model.language_model.layers = nn.ModuleList(
-            [nn.Identity() for _ in range(num_layers)]
-        )
-        self.action_expert.model.layers = nn.ModuleList(
-            [nn.Identity() for _ in range(num_layers)]
-        )
 
     def set_fsdp_compute_dtype(self, dtype: torch.dtype) -> None:
         """Record the unsharded compute dtype without consulting DTensor shards."""
@@ -598,33 +595,15 @@ class PI05Model(nn.Module):
         )
 
     def init_qkv_fusion_from_existing(self) -> None:
-        """Fuse Q/K/V projections into single QKVLinear for faster inference.
-        
-        This replaces separate q_proj, k_proj, v_proj with a single fused
-        projection, reducing memory bandwidth and kernel launch overhead.
-        """
-        backbones = [
-            self.vlm.model.language_model,
-            self.action_expert.model,
-        ]
-
-        for backbone in backbones:
-            num_layers = backbone.config.num_hidden_layers
-            for idx in range(num_layers):
-                layer = backbone.layers[idx]
-                attn = layer.self_attn
-
-                q_proj: nn.Linear = attn.q_proj
-                k_proj: nn.Linear = attn.k_proj
-                v_proj: nn.Linear = attn.v_proj
-
-                hidden_size = q_proj.in_features
+        """Fuse each attention's q/k/v projections into one QKVLinear."""
+        for layer in self.layers:
+            for attn in (layer.self_attn.vlm_attention, layer.self_attn.action_expert_attention):
+                q_proj, k_proj, v_proj = attn.q_proj, attn.k_proj, attn.v_proj
                 head_dim = attn.head_dim
-                num_heads = self.vlm.model.language_model.config.num_attention_heads
-                num_kv_heads = self.vlm.model.language_model.config.num_key_value_heads
-
+                num_heads = attn.config.num_attention_heads
+                num_kv_heads = attn.config.num_key_value_heads
                 qkv = QKVLinear(
-                    hidden_size=hidden_size,
+                    hidden_size=q_proj.in_features,
                     head_size=head_dim,
                     total_num_heads=num_heads,
                     total_num_kv_heads=num_kv_heads,
@@ -632,66 +611,33 @@ class PI05Model(nn.Module):
                 )
                 attn.qkv_proj = qkv
                 qkv.to(device=q_proj.weight.device, dtype=q_proj.weight.dtype)
-
                 with torch.no_grad():
-                    out_w = qkv.weight
-                    q_w = q_proj.weight
-                    k_w = k_proj.weight
-                    v_w = v_proj.weight
-
-                    head_dim_total = head_dim
-                    q_span = num_heads * head_dim_total
-                    kv_span = num_kv_heads * head_dim_total
-
-                    out_w[:q_span].copy_(q_w)
-                    out_w[q_span : q_span + kv_span].copy_(k_w)
-                    out_w[q_span + kv_span :].copy_(v_w)
-
+                    q_span = num_heads * head_dim
+                    kv_span = num_kv_heads * head_dim
+                    qkv.weight[:q_span].copy_(q_proj.weight)
+                    qkv.weight[q_span:q_span + kv_span].copy_(k_proj.weight)
+                    qkv.weight[q_span + kv_span:].copy_(v_proj.weight)
                     if qkv.bias is not None:
-                        out_b = qkv.bias
-                        q_b = q_proj.bias
-                        k_b = k_proj.bias
-                        v_b = v_proj.bias
-
-                        out_b[:q_span].copy_(q_b)
-                        out_b[q_span : q_span + kv_span].copy_(k_b)
-                        out_b[q_span + kv_span :].copy_(v_b)
-
+                        qkv.bias[:q_span].copy_(q_proj.bias)
+                        qkv.bias[q_span:q_span + kv_span].copy_(k_proj.bias)
+                        qkv.bias[q_span + kv_span:].copy_(v_proj.bias)
                 delattr(attn, "q_proj")
                 delattr(attn, "k_proj")
                 delattr(attn, "v_proj")
 
     def init_mlp_fusion_from_existing(self) -> None:
-        """Fuse gate/up projections into single MergedColumnLinear.
-        
-        Similar to QKV fusion, this reduces kernel launches for MLP.
-        """
-        backbones = [
-            self.vlm.model.language_model,
-            self.action_expert.model,
-        ]
-
-        for backbone in backbones:
-            num_layers = backbone.config.num_hidden_layers
-            for idx in range(num_layers):
-                layer = backbone.layers[idx]
-                mlp = layer.mlp
-
-                hidden_size = mlp.hidden_size
+        """Fuse each MLP's gate/up projections into one MergedColumnLinear."""
+        for layer in self.layers:
+            for mlp in (layer.mlp.vlm_mlp, layer.mlp.action_expert_mlp):
                 intermediate_size = mlp.intermediate_size
-
                 gate_up = MergedColumnLinear(
-                    hidden_size,
-                    [intermediate_size, intermediate_size],
-                    bias=False,
+                    mlp.hidden_size, [intermediate_size, intermediate_size], bias=False
                 )
                 mlp.gate_up_proj = gate_up
                 gate_up.to(device=mlp.gate_proj.weight.device, dtype=mlp.gate_proj.weight.dtype)
-
                 with torch.no_grad():
                     gate_up.weight[:intermediate_size].copy_(mlp.gate_proj.weight)
                     gate_up.weight[intermediate_size:].copy_(mlp.up_proj.weight)
-
                 delattr(mlp, "gate_proj")
                 delattr(mlp, "up_proj")
 
@@ -1145,25 +1091,10 @@ class PI05Policy(PreTrainedPolicy):
         self.reset()
 
     def prepare_for_fsdp(self, *, compute_dtype: torch.dtype) -> None:
-        """Finalize canonical decoder ownership before distributed wrapping."""
+        """Record the compute dtype and keep the unused lm_heads out of the optimizer."""
         self.model.set_fsdp_compute_dtype(compute_dtype)
-        for lm_head, embedding in (
-            (self.model.vlm.lm_head, self.model.vlm.language_model.embed_tokens),
-            (self.model.action_expert.lm_head, self.model.action_expert.model.embed_tokens),
-        ):
-            if lm_head.weight is not embedding.weight:
-                lm_head.requires_grad_(False)
-
-        parameter_ids_before = {id(parameter) for parameter in self.parameters()}
-        self.model.detach_backbone_layer_aliases()
-        parameter_ids_after = {id(parameter) for parameter in self.parameters()}
-        if parameter_ids_before != parameter_ids_after:
-            raise RuntimeError(
-                "Detaching PI0.5 backbone aliases changed the parameter set: "
-                f"before={len(parameter_ids_before)}, after={len(parameter_ids_after)}, "
-                f"dropped={len(parameter_ids_before - parameter_ids_after)}, "
-                f"added={len(parameter_ids_after - parameter_ids_before)}"
-            )
+        self.model.vlm.lm_head.requires_grad_(False)
+        self.model.action_expert.lm_head.requires_grad_(False)
 
     @classmethod
     def _load_as_safetensor(
@@ -1171,16 +1102,13 @@ class PI05Policy(PreTrainedPolicy):
     ) -> T:
         """Fill a freshly-built policy from ``model.safetensors``.
 
-        Overrides lerobot's supported hook (the base ``from_pretrained`` resolves
-        the config, downloads/locates the file, and builds the instance first).
-        The shared loader maps a raw openpi base (``paligemma_with_expert.*``) into
-        this namespace, restores the tied embeddings the base dropped, and asserts
-        full coverage; native ``model.*`` keys pass through the same path with an
-        identity remap. qkv/mlp fusion runs here; the base does ``.to`` / ``.eval``.
+        Overrides lerobot's hook (the base ``from_pretrained`` resolves the
+        config, locates the file and builds the instance first). The load is
+        lerobot's recipe: rename the openpi keys, then one strict
+        ``load_state_dict``. qkv/mlp fusion runs here; the base does ``.to`` /
+        ``.eval`` afterwards.
         """
-        load_remapped_checkpoint(
-            model, model_file, PI05_RENAME_RULES, native_load_model=False
-        )
+        load_pi05_checkpoint(model, model_file)
 
         if getattr(model.config, "fuse_qkv", True):
             model.model.init_qkv_fusion_from_existing()
