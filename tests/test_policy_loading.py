@@ -191,6 +191,19 @@ class PI05LoadingTest(unittest.TestCase):
         self.assertEqual(set(converted), self.names)
         self.assertTrue(torch.equal(converted[PI05_VLM_HEAD_KEY], converted[PI05_VLM_EMBED_KEY]))
 
+    def test_legacy_headless_fsdp_export_converts(self) -> None:
+        # The z-lab/flashvla-pi05-robotwin layout: joint-layer names throughout, both
+        # embeddings present, neither lm_head saved. The tied model held the embedding
+        # value in each head, so conversion re-creates both heads from the embeddings.
+        state = _fake(sorted(self.names))
+        del state[PI05_VLM_HEAD_KEY]
+        del state[EXPERT_HEAD_KEY]
+        state[EXPERT_EMBED_KEY] = torch.full((1,), 5.0)
+        converted = convert_legacy_state_dict(state, tied_heads=True)
+        self.assertEqual(set(converted), self.names)
+        self.assertTrue(torch.equal(converted[PI05_VLM_HEAD_KEY], state[PI05_VLM_EMBED_KEY]))
+        self.assertIs(converted[EXPERT_HEAD_KEY], state[EXPERT_EMBED_KEY])
+
     def test_untied_legacy_export_keeps_its_heads(self) -> None:
         state = _fake(sorted(self.names))
         state[LANG_EMBEDDER_KEY] = state[PI05_VLM_EMBED_KEY].clone()
