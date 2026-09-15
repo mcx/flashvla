@@ -122,10 +122,11 @@ This project builds on [LeRobot](https://github.com/huggingface/lerobot) and
 ## Citation
 
 ```bibtex
-@article{flashvla2026,
-  title   = {{FlashVLA: Streaming Action Decoding for Fast and Asynchronous VLA Inference}},
-  author  = {Li, Zekai and Tang, Jiaming and Liu, Zhijian},
-  year    = {2026}
+@inproceedings{flashvla2026,
+  title = {{FlashVLA: Streaming Action Decoding for Fast and Asynchronous VLA Inference}},
+  author = {Li, Zekai and Tang, Jiaming and Liu, Zhijian},
+  booktitle = {Conference on Robot Learning (CoRL)},
+  year = {2026}
 }
 ```
 
